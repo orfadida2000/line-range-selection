@@ -1,0 +1,89 @@
+{
+  "name": "line-range-selection",
+  "displayName": "Line Range Selection",
+  "description": "Select a range of lines, with optional column specifiers, where the end position defaults to the end of the document if not specified.",
+  "version": "0.0.1",
+  "icon": "assets/icon.png",
+  "publisher": "orfadida",
+  "author": {
+    "name": "Or Fadida",
+    "email": "or@fadida.net"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/orfadida2000/line-range-selection.git"
+  },
+  "bugs": {
+    "url": "https://github.com/orfadida2000/line-range-selection/issues"
+  },
+  "engines": {
+    "vscode": "^1.68.0"
+  },
+  "keywords": [
+    "text selection",
+    "line selection",
+    "select lines",
+    "line range",
+    "selection",
+    "editor"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:line-range-selection.selectLineRange"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "line-range-selection.selectLineRange",
+        "title": "Select Line Range",
+        "category": "Line Range Selection"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "line-range-selection.selectLineRange",
+        "key": "ctrl+[ ctrl+]",
+        "mac": "cmd+[ cmd+]",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "line-range-selection.selectLineRange",
+          "when": "editorTextFocus"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "line-range-selection.selectLineRange",
+          "when": "editorTextFocus",
+          "group": "selection@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "package": "vsce package",
+    "publish": "vsce publish",
+    "publish:patch": "vsce publish patch",
+    "publish:minor": "vsce publish minor",
+    "publish:major": "vsce publish major"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^16.18.0",
+    "@types/vscode": "1.68.0",
+    "@vscode/vsce": "^4.0.0",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
+    "typescript": "^7.0.2"
+  }
+}

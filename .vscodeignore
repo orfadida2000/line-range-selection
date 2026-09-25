@@ -1,0 +1,72 @@
+# Project specific files
+vsc-extension-quickstart.md
+assets/*.png
+!assets/icon.png
+assets/preview/**
+
+# Git
+.git/**
+.gitignore
+
+# VS Code workspace/config files
+.vscode/**
+.vscodeignore
+
+# Tests
+.vscode-test/**
+test/**
+
+# Packaged VS Code extensions
+*.vsix
+
+# npm / package manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Dependency lockfile - keep in Git, exclude from VSIX
+package-lock.json
+
+# Node / tool version managers
+.nvmrc
+.node-version
+.tool-versions
+.mise.toml
+mise.toml
+
+# Package-manager / npm config files not needed at runtime
+.npmrc
+.yarnrc
+.yarnrc.yml
+.pnpmrc
+
+# npm package publishing metadata, not needed in VSIX
+.npmignore
+
+# Coverage / test output
+coverage/
+.nyc_output/
+
+# Temporary/cache files
+tmp/
+temp/
+.cache/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+
+# JavaScript related config files
+**/.eslintrc.json
+**/jsconfig.json
