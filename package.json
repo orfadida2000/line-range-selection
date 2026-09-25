@@ -2,7 +2,7 @@
   "name": "line-range-selection",
   "displayName": "Line Range Selection",
   "description": "Select a range of lines, with optional column specifiers, where the end position defaults to the end of the document if not specified.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "icon": "assets/icon.png",
   "publisher": "orfadida",
   "author": {
@@ -39,6 +39,24 @@
     "ui"
   ],
   "contributes": {
+    "configuration": {
+      "title": "Line Range Selection",
+      "properties": {
+        "line-range-selection.coordinateMode": {
+          "type": "string",
+          "enum": [
+            "character",
+            "column"
+          ],
+          "enumDescriptions": [
+            "Treat the secondary coordinate as a 1-based Unicode code-point character number. Explicit character endpoints are inclusive.",
+            "Treat the secondary coordinate as a 1-based text position between Unicode code points."
+          ],
+          "default": "character",
+          "description": "Controls how the optional secondary coordinate in a line specifier is interpreted."
+        }
+      }
+    },
     "commands": [
       {
         "command": "line-range-selection.selectLineRange",

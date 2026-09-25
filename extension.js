@@ -2,15 +2,31 @@ const vscode = require("vscode");
 
 const COMMAND_NAME = "line-range-selection.selectLineRange";
 
+/**
+ * Supported interpretations of the optional secondary coordinate.
+ *
+ * CHARACTER:
+ *   The coordinate is a 1-based Unicode code-point character number.
+ *   Explicit character endpoints are inclusive.
+ *
+ * COLUMN:
+ *   The coordinate is a 1-based logical text position between Unicode
+ *   code points. Column 1 is the beginning of the line, and each Unicode
+ *   code point advances the column by one.
+ */
+const CoordinateMode = Object.freeze({
+  CHARACTER: "character",
+  COLUMN: "column",
+});
+
 /*
  * Semantic boundary targets used only after selection direction is known.
  *
- * Explicit character specifiers remain positive 1-based Unicode code-point
- * numbers. An omitted or unusable character specifier is initially represented
- * by null and is converted to LINE_START or LINE_END only after direction has
- * been determined.
+ * An explicit secondary coordinate remains a positive resolved integer.
+ * An omitted or unusable coordinate is initially represented by null and is
+ * converted to LINE_START or LINE_END only after direction has been determined.
  */
-const CharacterTarget = Object.freeze({
+const CoordinateTarget = Object.freeze({
   LINE_START: "LINE_START",
   LINE_END: "LINE_END",
 });
@@ -32,7 +48,7 @@ const permissiveLineRangeRegex = new RegExp(
 );
 
 /**
- * Parse one line/character component after strict syntactic validation.
+ * Parse one numeric component after strict syntactic validation.
  *
  * @param {string} text
  * @returns {{ valid: boolean, value: number }}
@@ -48,55 +64,57 @@ const parseNonZeroComponent = (text) => {
 /**
  * Build the live validation message for the input box.
  *
- * Character numbers in the UI are 1-based Unicode code-point numbers.
- * Negative line numbers count from the end of the document; negative character
- * numbers count from the end of the corresponding line.
+ * Line numbers are always 1-based. The optional secondary coordinate is either
+ * a 1-based Unicode code-point character number or a 1-based logical column
+ * position, depending on the configured coordinate mode.
  *
  * @param {string} text
+ * @param {string} coordinateMode
  * @returns {vscode.InputBoxValidationMessage | undefined}
  */
-const getValidationMessage = (text) => {
+const getValidationMessage = (text, coordinateMode) => {
   text = text.trim();
 
   if (text === "") {
     return undefined;
   }
 
+  const coordinateName = coordinateMode === CoordinateMode.CHARACTER ? "character" : "column";
+
   const match = text.match(permissiveLineRangeRegex);
 
   if (!match) {
     return {
       message:
-        "Invalid format. Use '<line>[:<character>] [<line>[:<character>]]' with non-zero integers.",
+        `Invalid format. Use '<line>[:<${coordinateName}>] ` +
+        `[<line>[:<${coordinateName}>]]' with non-zero integers.`,
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
 
   const startLine = match[1] || "";
-  const startCharacterWithColon = match[2] || "";
-  const startCharacter = match[3] || "";
+  const startCoordinateWithColon = match[2] || "";
+  const startCoordinate = match[3] || "";
   const endLine = match[4] || "";
-  const endCharacterWithColon = match[5] || "";
-  const endCharacter = match[6] || "";
+  const endCoordinateWithColon = match[5] || "";
+  const endCoordinate = match[6] || "";
 
   const startLineData = parseNonZeroComponent(startLine);
-  const startCharacterData = parseNonZeroComponent(startCharacter);
+  const startCoordinateData = parseNonZeroComponent(startCoordinate);
   const endLineData = parseNonZeroComponent(endLine);
-  const endCharacterData = parseNonZeroComponent(endCharacter);
+  const endCoordinateData = parseNonZeroComponent(endCoordinate);
 
   const startSpecifierValid =
-    startLineData.valid && (startCharacterWithColon === "" || startCharacterData.valid);
+    startLineData.valid && (startCoordinateWithColon === "" || startCoordinateData.valid);
 
   const endSpecifierValid =
-    endLineData.valid && (endCharacterWithColon === "" || endCharacterData.valid);
+    endLineData.valid && (endCoordinateWithColon === "" || endCoordinateData.valid);
 
-  const hasStartedEndSpecifier = endLine !== "" || endCharacterWithColon !== "";
+  const hasStartedEndSpecifier = endLine !== "" || endCoordinateWithColon !== "";
 
-  // Error states that are already structurally invalid, rather than merely
-  // incomplete.
-  if (startCharacterWithColon !== "" && !startLineData.valid) {
+  if (startCoordinateWithColon !== "" && !startLineData.valid) {
     return {
-      message: "Finish a valid start line before adding a character number.",
+      message: `Finish a valid start line before adding a ${coordinateName} number.`,
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -108,9 +126,9 @@ const getValidationMessage = (text) => {
     };
   }
 
-  if (endCharacterWithColon !== "" && !endLineData.valid) {
+  if (endCoordinateWithColon !== "" && !endLineData.valid) {
     return {
-      message: "Finish a valid end line before adding a character number.",
+      message: `Finish a valid end line before adding a ${coordinateName} number.`,
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -124,23 +142,23 @@ const getValidationMessage = (text) => {
     };
   }
 
-  const startCharacterDescription = startCharacterData.valid
-    ? ` character ${startCharacterData.value}`
+  const startCoordinateDescription = startCoordinateData.valid
+    ? ` ${coordinateName} ${startCoordinateData.value}`
     : "";
 
-  const endCharacterDescription = endCharacterData.valid
-    ? ` character ${endCharacterData.value}`
+  const endCoordinateDescription = endCoordinateData.valid
+    ? ` ${coordinateName} ${endCoordinateData.value}`
     : "";
 
   let message;
 
   if (hasStartedEndSpecifier) {
     message =
-      `Will select from line ${startLineData.value}${startCharacterDescription} ` +
-      `to line ${endLineData.value}${endCharacterDescription}`;
+      `Will select from line ${startLineData.value}${startCoordinateDescription} ` +
+      `to line ${endLineData.value}${endCoordinateDescription}`;
   } else {
     message =
-      `Will select from line ${startLineData.value}${startCharacterDescription} ` +
+      `Will select from line ${startLineData.value}${startCoordinateDescription} ` +
       "to the end of the document";
   }
 
@@ -159,18 +177,28 @@ const getValidationMessage = (text) => {
  * Informational validation states therefore remain non-blocking visually while
  * Enter is accepted only when the complete value matches the strict grammar.
  *
+ * @param {string} coordinateMode
  * @returns {Promise<string | undefined>}
  */
-const showLineRangeInputBox = () =>
+const showLineRangeInputBox = (coordinateMode) =>
   new Promise((resolve) => {
     const inputBox = vscode.window.createInputBox();
 
+    const coordinateName = coordinateMode === CoordinateMode.CHARACTER ? "character" : "column";
+
+    const coordinateSemantics =
+      coordinateMode === CoordinateMode.CHARACTER
+        ? "Character numbers are 1-based Unicode code-point numbers, and explicit character endpoints are inclusive. "
+        : "Column numbers are 1-based logical text positions between Unicode code points; column 1 is the beginning of the line. ";
+
     inputBox.title = "Select Line Range";
     inputBox.prompt =
-      "Enter '<line>[:<character>] [<line>[:<character>]]'. " +
-      "Line and character numbers are 1-based; character numbers count Unicode code points. " +
+      `Enter '<line>[:<${coordinateName}>] ` +
+      `[<line>[:<${coordinateName}>]]'. ` +
+      "Line numbers are 1-based. " +
+      coordinateSemantics +
       "Negative values count from the end of the document or line. " +
-      "Explicit character endpoints are inclusive, an omitted end specifier means the end of the document, " +
+      "An omitted end specifier means the end of the document, " +
       "and out-of-bounds values are clipped.";
 
     inputBox.placeholder = "e.g. 13, 13:2 20, 13 -1:6, 13:5";
@@ -200,7 +228,7 @@ const showLineRangeInputBox = () =>
 
     disposables.push(
       inputBox.onDidChangeValue((value) => {
-        inputBox.validationMessage = getValidationMessage(value);
+        inputBox.validationMessage = getValidationMessage(value, coordinateMode);
       }),
     );
 
@@ -208,14 +236,11 @@ const showLineRangeInputBox = () =>
       inputBox.onDidAccept(() => {
         const value = inputBox.value.trim();
 
-        // Preserve the no-op behavior for empty input.
         if (value === "") {
           inputBox.hide();
           return;
         }
 
-        // Info/Warning messages do not inherently prevent acceptance in the
-        // Quick Input API, so enforce the strict grammar explicitly.
         if (!lineRangeRegex.test(value)) {
           return;
         }
@@ -252,19 +277,27 @@ const normalizeAndClipLineNumber = (lineNumber, lineCount) => {
 /**
  * Analyze one resolved document line.
  *
- * User-facing character numbers count Unicode code points. VS Code
- * Position.character values, however, are UTF-16 code-unit offsets.
+ * User-facing coordinates operate on Unicode code-point boundaries, while
+ * vscode.Position.character uses UTF-16 code-unit offsets.
  *
- * afterOffsets is indexed by the 1-based user character number:
+ * afterOffsets provides the common translation table used by both coordinate
+ * modes:
  *
- *   afterOffsets[n] = UTF-16 offset immediately after character n
+ *   afterOffsets[n] = UTF-16 offset immediately after Unicode code point n
  *
- * afterOffsets[0] is the line-start boundary (offset 0), which also means the
- * UTF-16 offset immediately before character 1.
+ * afterOffsets[0] is the line-start boundary at UTF-16 offset 0.
+ *
+ * Therefore:
+ *
+ *   before character n = afterOffsets[n - 1]
+ *   after character n  = afterOffsets[n]
+ *
+ * and logical column n corresponds to:
+ *
+ *   n === 1 ? line start : after character (n - 1)
  *
  * JavaScript's string iterator advances by Unicode code point, while each
- * yielded string has a UTF-16 length of either 1 or 2 code units. Accumulating
- * those lengths constructs the translation between the two coordinate systems.
+ * yielded string occupies one or two UTF-16 code units.
  *
  * @param {vscode.TextDocument} document
  * @param {number} lineNumber - Resolved 1-based line number.
@@ -295,68 +328,78 @@ const analyzeLine = (document, lineNumber) => {
 };
 
 /**
- * Resolve an explicitly supplied signed character number.
+ * Resolve an explicitly supplied signed secondary coordinate.
  *
- * Negative normalization and clipping occur in the user-facing character
- * domain, using the line's Unicode code-point count rather than its UTF-16
- * length.
+ * Character mode:
+ *   valid coordinates are 1..characterCount.
+ *   An empty line has no valid character coordinate and therefore resolves
+ *   an explicit value to null.
  *
- * If the line is empty, no real character number exists, so null is returned.
- * null is intentionally deferred until selection direction is known; it will
- * later become LINE_START or LINE_END.
+ * Column mode:
+ *   valid coordinates are 1..characterCount + 1.
+ *   Even an empty line therefore has one valid column: column 1.
  *
- * @param {number | null} characterNumber
+ * Negative normalization and clipping occur entirely in the corresponding
+ * user-facing coordinate domain.
+ *
+ * @param {number | null} coordinateNumber
  * @param {{ characterCount: number }} lineAnalysis
+ * @param {string} coordinateMode
  * @returns {number | null}
  */
-const resolveExplicitCharacterNumber = (characterNumber, lineAnalysis) => {
-  if (characterNumber === null) {
+const resolveExplicitCoordinate = (coordinateNumber, lineAnalysis, coordinateMode) => {
+  if (coordinateNumber === null) {
     return null;
   }
 
-  const { characterCount } = lineAnalysis;
+  const maximumCoordinate =
+    coordinateMode === CoordinateMode.CHARACTER
+      ? lineAnalysis.characterCount
+      : lineAnalysis.characterCount + 1;
 
-  if (characterCount === 0) {
+  if (maximumCoordinate === 0) {
     return null;
   }
 
-  let resolvedCharacterNumber =
-    characterNumber < 0 ? characterCount + 1 + characterNumber : characterNumber;
+  let resolvedCoordinateNumber =
+    coordinateNumber < 0 ? maximumCoordinate + 1 + coordinateNumber : coordinateNumber;
 
-  if (resolvedCharacterNumber < 1) {
-    resolvedCharacterNumber = 1;
-  } else if (resolvedCharacterNumber > characterCount) {
-    resolvedCharacterNumber = characterCount;
+  if (resolvedCoordinateNumber < 1) {
+    resolvedCoordinateNumber = 1;
+  } else if (resolvedCoordinateNumber > maximumCoordinate) {
+    resolvedCoordinateNumber = maximumCoordinate;
   }
 
-  return resolvedCharacterNumber;
+  return resolvedCoordinateNumber;
 };
 
 /**
- * Determine selection direction after lines and all usable explicit character
- * numbers have been resolved.
+ * Determine selection direction after lines and all usable explicit secondary
+ * coordinates have been resolved.
  *
  * Different resolved line numbers determine direction directly.
  *
- * On the same resolved line, character numbers determine direction only when
- * both are real resolved character numbers. Equality is forward, so selecting
- * n -> n selects exactly character n and leaves the active cursor after it.
+ * On the same resolved line, the explicit secondary coordinates determine
+ * direction only when both are available. Equality is considered forward.
  *
- * If either character target is null on the same line (because it was omitted,
- * or because an explicitly supplied character resolved against an empty line),
- * the selection is defined as forward.
+ * In character mode, equal coordinates later produce a one-character
+ * selection. In column mode, equal coordinates later produce equal VS Code
+ * positions and therefore a no-op.
+ *
+ * If either coordinate target is null on the same line, the selection is
+ * defined as forward.
  *
  * @param {number} startLineNumber
  * @param {number} endLineNumber
- * @param {number | null} startCharacterTarget
- * @param {number | null} endCharacterTarget
+ * @param {number | null} startCoordinateTarget
+ * @param {number | null} endCoordinateTarget
  * @returns {boolean}
  */
 const isForwardSelection = (
   startLineNumber,
   endLineNumber,
-  startCharacterTarget,
-  endCharacterTarget,
+  startCoordinateTarget,
+  endCoordinateTarget,
 ) => {
   if (startLineNumber < endLineNumber) {
     return true;
@@ -366,8 +409,8 @@ const isForwardSelection = (
     return false;
   }
 
-  if (startCharacterTarget !== null && endCharacterTarget !== null) {
-    return startCharacterTarget <= endCharacterTarget;
+  if (startCoordinateTarget !== null && endCoordinateTarget !== null) {
+    return startCoordinateTarget <= endCoordinateTarget;
   }
 
   return true;
@@ -394,48 +437,81 @@ const getPositionAfterCharacter = (lineAnalysis, characterNumber) =>
   lineAnalysis.afterOffsets[characterNumber];
 
 /**
- * Convert one fully resolved semantic character target into the UTF-16
+ * Get the UTF-16 position represented by a valid 1-based logical column.
+ *
+ * Column 1 is the line-start boundary. Any later column n is the position
+ * immediately after Unicode code-point character n - 1.
+ *
+ * @param {{ afterOffsets: number[] }} lineAnalysis
+ * @param {number} columnNumber - Valid 1-based logical column number.
+ * @returns {number}
+ */
+const getPositionAtColumn = (lineAnalysis, columnNumber) => {
+  if (columnNumber === 1) {
+    return 0;
+  }
+
+  return getPositionAfterCharacter(lineAnalysis, columnNumber - 1);
+};
+
+/**
+ * Convert one fully resolved semantic coordinate target into the UTF-16
  * character offset expected by vscode.Position.
  *
- * LINE_START and LINE_END map directly to line boundaries.
+ * LINE_START and LINE_END map directly to physical line boundaries in both
+ * modes.
  *
- * Explicit character endpoints are inclusive:
+ * Character mode uses inclusive explicit character endpoints:
  *
- * Forward selection:
+ * Forward:
  *   start -> before(start character)
  *   end   -> after(end character)
  *
- * Backward selection:
+ * Backward:
  *   start -> after(start character)
  *   end   -> before(end character)
+ *
+ * Column mode already specifies a text boundary directly, so selection
+ * direction and endpoint role do not affect conversion.
  *
  * @param {{
  *   utf16Length: number,
  *   afterOffsets: number[]
  * }} lineAnalysis
- * @param {number | string} characterTarget
+ * @param {number | string} coordinateTarget
  * @param {boolean} isStart
  * @param {boolean} forwardSelection
+ * @param {string} coordinateMode
  * @returns {number}
  */
-const characterTargetToPosition = (lineAnalysis, characterTarget, isStart, forwardSelection) => {
-  if (characterTarget === CharacterTarget.LINE_START) {
+const coordinateTargetToPosition = (
+  lineAnalysis,
+  coordinateTarget,
+  isStart,
+  forwardSelection,
+  coordinateMode,
+) => {
+  if (coordinateTarget === CoordinateTarget.LINE_START) {
     return 0;
   }
 
-  if (characterTarget === CharacterTarget.LINE_END) {
+  if (coordinateTarget === CoordinateTarget.LINE_END) {
     return lineAnalysis.utf16Length;
+  }
+
+  if (coordinateMode === CoordinateMode.COLUMN) {
+    return getPositionAtColumn(lineAnalysis, coordinateTarget);
   }
 
   if (isStart) {
     return forwardSelection
-      ? getPositionBeforeCharacter(lineAnalysis, characterTarget)
-      : getPositionAfterCharacter(lineAnalysis, characterTarget);
+      ? getPositionBeforeCharacter(lineAnalysis, coordinateTarget)
+      : getPositionAfterCharacter(lineAnalysis, coordinateTarget);
   }
 
   return forwardSelection
-    ? getPositionAfterCharacter(lineAnalysis, characterTarget)
-    : getPositionBeforeCharacter(lineAnalysis, characterTarget);
+    ? getPositionAfterCharacter(lineAnalysis, coordinateTarget)
+    : getPositionBeforeCharacter(lineAnalysis, coordinateTarget);
 };
 
 /**
@@ -445,7 +521,16 @@ function activate(context) {
   const disposable = vscode.commands.registerTextEditorCommand(
     COMMAND_NAME,
     async (/** @type {vscode.TextEditor} */ editor) => {
-      const input = await showLineRangeInputBox();
+      const configuredCoordinateMode = vscode.workspace
+        .getConfiguration("line-range-selection", editor.document.uri)
+        .get("coordinateMode", CoordinateMode.CHARACTER);
+
+      const coordinateMode =
+        configuredCoordinateMode === CoordinateMode.COLUMN
+          ? CoordinateMode.COLUMN
+          : CoordinateMode.CHARACTER;
+
+      const input = await showLineRangeInputBox(coordinateMode);
 
       if (input === undefined) {
         return;
@@ -463,12 +548,12 @@ function activate(context) {
        * Raw parsed values.
        *
        * Explicit zero is impossible by grammar, so null can safely represent an
-       * omitted line/character component.
+       * omitted line or secondary-coordinate component.
        */
       const startLineInput = parseInt(match[1], 10);
-      const startCharacterInput = match[2] !== undefined ? parseInt(match[2], 10) : null;
+      const startCoordinateInput = match[2] !== undefined ? parseInt(match[2], 10) : null;
       const endLineInput = match[3] !== undefined ? parseInt(match[3], 10) : null;
-      const endCharacterInput = match[4] !== undefined ? parseInt(match[4], 10) : null;
+      const endCoordinateInput = match[4] !== undefined ? parseInt(match[4], 10) : null;
 
       const document = editor.document;
       const lineCount = document.lineCount;
@@ -484,7 +569,7 @@ function activate(context) {
 
       // ---------------------------------------------------------------------
       // Stage 2: Analyze the resolved boundary lines and resolve only
-      // explicitly supplied character numbers.
+      // explicitly supplied secondary coordinates.
       // ---------------------------------------------------------------------
 
       const startLineAnalysis = analyzeLine(document, startLineNumber);
@@ -494,62 +579,69 @@ function activate(context) {
           ? startLineAnalysis
           : analyzeLine(document, endLineNumber);
 
-      let startCharacterTarget = resolveExplicitCharacterNumber(
-        startCharacterInput,
+      let startCoordinateTarget = resolveExplicitCoordinate(
+        startCoordinateInput,
         startLineAnalysis,
+        coordinateMode,
       );
 
-      let endCharacterTarget = resolveExplicitCharacterNumber(endCharacterInput, endLineAnalysis);
+      let endCoordinateTarget = resolveExplicitCoordinate(
+        endCoordinateInput,
+        endLineAnalysis,
+        coordinateMode,
+      );
 
       // ---------------------------------------------------------------------
-      // Stage 3: Determine direction, then resolve remaining null character
+      // Stage 3: Determine direction, then resolve remaining null coordinate
       // targets to semantic line boundaries.
       // ---------------------------------------------------------------------
 
       const forwardSelection = isForwardSelection(
         startLineNumber,
         endLineNumber,
-        startCharacterTarget,
-        endCharacterTarget,
+        startCoordinateTarget,
+        endCoordinateTarget,
       );
 
-      if (startCharacterTarget === null) {
-        startCharacterTarget = forwardSelection
-          ? CharacterTarget.LINE_START
-          : CharacterTarget.LINE_END;
+      if (startCoordinateTarget === null) {
+        startCoordinateTarget = forwardSelection
+          ? CoordinateTarget.LINE_START
+          : CoordinateTarget.LINE_END;
       }
 
-      if (endCharacterTarget === null) {
-        endCharacterTarget = forwardSelection
-          ? CharacterTarget.LINE_END
-          : CharacterTarget.LINE_START;
+      if (endCoordinateTarget === null) {
+        endCoordinateTarget = forwardSelection
+          ? CoordinateTarget.LINE_END
+          : CoordinateTarget.LINE_START;
       }
 
       // ---------------------------------------------------------------------
       // Stage 4: Translate semantic endpoints into VS Code positions.
       // ---------------------------------------------------------------------
 
-      const startCharacterPosition = characterTargetToPosition(
+      const startCharacterPosition = coordinateTargetToPosition(
         startLineAnalysis,
-        startCharacterTarget,
+        startCoordinateTarget,
         true,
         forwardSelection,
+        coordinateMode,
       );
 
-      const endCharacterPosition = characterTargetToPosition(
+      const endCharacterPosition = coordinateTargetToPosition(
         endLineAnalysis,
-        endCharacterTarget,
+        endCoordinateTarget,
         false,
         forwardSelection,
+        coordinateMode,
       );
 
       const startPos = new vscode.Position(startLineNumber - 1, startCharacterPosition);
 
       const endPos = new vscode.Position(endLineNumber - 1, endCharacterPosition);
 
-      // Under the current semantics this normally occurs only when both
-      // endpoints resolve to the same empty line. Test the actual VS Code
-      // positions directly because that is the invariant that matters.
+      // If both semantic endpoints resolve to the same physical VS Code
+      // position, there is no text to select. Test the final positions directly
+      // because that is the invariant that matters in both coordinate modes.
       if (startPos.isEqual(endPos)) {
         return;
       }
