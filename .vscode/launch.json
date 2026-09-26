@@ -10,13 +10,6 @@
       "type": "extensionHost",
       "request": "launch",
       "args": ["--extensionDevelopmentPath=${workspaceFolder}"]
-    },
-    {
-      "name": "Run Extension (VS Code 1.68)",
-      "type": "extensionHost",
-      "request": "launch",
-      "runtimeExecutable": "H:\\Tools\\VS Code portable versions\\VSCode-win32-x64-1.68.1\\Code.exe",
-      "args": ["--extensionDevelopmentPath=${workspaceFolder}"]
     }
   ]
 }

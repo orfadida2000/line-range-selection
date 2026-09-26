@@ -1,8 +1,18 @@
 # Changelog
 
-All notable changes to **Line Range Selection** will be documented in this file.
+All notable changes to **Precise Line Range Selection** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
+
+## [1.0.0]
+
+### Changed
+
+- Renamed the extension from **Line Range Selection** to **Precise Line Range Selection**.
+- Changed the extension package identifier from `line-range-selection` to `precise-line-range-selection`.
+- Changed the command identifier from `line-range-selection.selectLineRange` to `precise-line-range-selection.selectLineRange`.
+- Changed the configuration setting from `line-range-selection.coordinateMode` to `precise-line-range-selection.coordinateMode`.
+- Character and column coordinates now use Unicode grapheme clusters instead of individual Unicode code points, so combining sequences and multi-code-point emoji are treated as single user-perceived characters.
 
 ## [0.0.2]
 

@@ -1,4 +1,4 @@
-# Line Range Selection
+# Precise Line Range Selection
 
 Select text ranges in Visual Studio Code by entering line numbers with optional secondary coordinates.
 
@@ -10,15 +10,40 @@ The extension supports:
 - Forward and backward selections
 - Unicode-aware coordinates
 - Two configurable coordinate modes:
-  - **Character mode** — inclusive Unicode code-point character numbers
-  - **Column mode** — logical text positions between Unicode code points
+  - **Character mode** — inclusive user-perceived character numbers
+  - **Column mode** — logical text positions between user-perceived characters
 - Selection to the end of the document when the end specifier is omitted
+
+## Installation
+
+### Visual Studio Code
+
+Install **Precise Line Range Selection** from the Visual Studio Code Extensions view:
+
+1. Open the Extensions view.
+2. Search for **Precise Line Range Selection**.
+3. Select the extension published by **Or Fadida**.
+4. Click **Install**.
+
+### Command Line
+
+You can also install the extension using the VS Code CLI:
+
+```text
+code --install-extension orfadida.precise-line-range-selection
+```
+
+To uninstall it:
+
+```text
+code --uninstall-extension orfadida.precise-line-range-selection
+```
 
 ## Usage
 
 Run:
 
-**Line Range Selection: Select Line Range**
+**Precise Line Range Selection: Select Line Range**
 
 from the Command Palette or editor context menu, or use the default keybinding:
 
@@ -84,7 +109,7 @@ For example, a value before the first line resolves to line 1, while a value bey
 The optional secondary coordinate is controlled by:
 
 ```json
-"line-range-selection.coordinateMode": "character"
+"precise-line-range-selection.coordinateMode": "character"
 ```
 
 Supported values are:
@@ -100,7 +125,7 @@ The default is:
 character
 ```
 
-Both modes count Unicode **code points**, not UTF-16 code units.
+Both modes operate on Unicode **grapheme clusters**, which correspond to user-perceived characters rather than UTF-16 code units or individual Unicode code points.
 
 For example, the line:
 
@@ -108,7 +133,7 @@ For example, the line:
 A😀B
 ```
 
-contains three Unicode code points:
+contains three user-perceived characters:
 
 ```text
 1: A
@@ -116,19 +141,27 @@ contains three Unicode code points:
 3: B
 ```
 
-Even though the emoji occupies two UTF-16 code units internally in JavaScript and VS Code.
+Likewise, a combining sequence such as:
 
-Combining sequences are not treated as single grapheme clusters. If a displayed character consists of multiple Unicode code points, each code point counts separately.
+```text
+é
+```
+
+where the displayed character may internally consist of `e` followed by a combining acute accent, is treated as one character.
+
+Multi-code-point emoji sequences are also treated as a single character when Unicode grapheme segmentation defines them as one grapheme cluster.
 
 ### Character Mode
 
 Configure:
 
 ```json
-"line-range-selection.coordinateMode": "character"
+"precise-line-range-selection.coordinateMode": "character"
 ```
 
-The secondary coordinate is a **1-based Unicode code-point character number**.
+The secondary coordinate is a **1-based user-perceived character number**.
+
+Characters are determined using Unicode grapheme-cluster boundaries.
 
 Explicit character endpoints are inclusive.
 
@@ -177,17 +210,25 @@ If both explicit endpoints refer to the same character:
 
 that character is selected.
 
+For a line such as:
+
+```text
+éX
+```
+
+the displayed `é` is treated as character 1 and `X` as character 2, even if `é` is internally represented by multiple Unicode code points.
+
 ### Column Mode
 
 Configure:
 
 ```json
-"line-range-selection.coordinateMode": "column"
+"precise-line-range-selection.coordinateMode": "column"
 ```
 
-The secondary coordinate is a **1-based logical text position between Unicode code points**.
+The secondary coordinate is a **1-based logical text position between user-perceived characters**.
 
-Column 1 is the beginning of the line. Every Unicode code point advances the logical column by exactly one.
+Column 1 is the beginning of the line. Every Unicode grapheme cluster advances the logical column by exactly one.
 
 For:
 
@@ -210,7 +251,7 @@ For:
 A😀B
 ```
 
-the logical columns are still:
+the logical columns are:
 
 ```text
 Column 1: before A
@@ -219,7 +260,21 @@ Column 3: after 😀 / before B
 Column 4: after B
 ```
 
-The emoji therefore advances the logical column by one even though VS Code represents it internally using two UTF-16 code units.
+Likewise, for:
+
+```text
+éX
+```
+
+the logical columns are:
+
+```text
+Column 1: before é
+Column 2: after é / before X
+Column 3: after X
+```
+
+A user-perceived character therefore advances the logical column by one regardless of how many Unicode code points or UTF-16 code units are required to represent it internally.
 
 Tabs behave the same way: a literal tab advances the logical column by one. This mode does **not** use VS Code's visual/status-bar column calculation and is independent of `tabSize`.
 
@@ -243,7 +298,7 @@ which is both the beginning and end of that line.
 
 Negative secondary coordinates count backward from the end of the relevant coordinate domain.
 
-In character mode, a line containing `N` Unicode code points has valid character numbers:
+In character mode, a line containing `N` user-perceived characters has valid character numbers:
 
 ```text
 1 .. N
@@ -378,7 +433,9 @@ Valid examples include:
 
 ```text
 1
++1
 001
++01
 -1
 -001
 15:3
@@ -389,6 +446,7 @@ Zero is not valid:
 
 ```text
 0
++0
 -0
 15:0
 ```
@@ -399,7 +457,7 @@ The input box performs live validation while typing and only accepts a complete 
 
 ## Configuration
 
-### `line-range-selection.coordinateMode`
+### `precise-line-range-selection.coordinateMode`
 
 Controls how the optional secondary coordinate is interpreted.
 
@@ -417,16 +475,16 @@ character
 
 Allowed values:
 
-| Value       | Meaning                                                                        |
-| ----------- | ------------------------------------------------------------------------------ |
-| `character` | 1-based Unicode code-point character numbers with inclusive explicit endpoints |
-| `column`    | 1-based logical text positions between Unicode code points                     |
+| Value       | Meaning                                                                    |
+| ----------- | -------------------------------------------------------------------------- |
+| `character` | 1-based user-perceived character numbers with inclusive explicit endpoints |
+| `column`    | 1-based logical text positions between user-perceived characters           |
 
 Example:
 
 ```json
 {
-  "line-range-selection.coordinateMode": "column"
+  "precise-line-range-selection.coordinateMode": "column"
 }
 ```
 
@@ -436,9 +494,9 @@ VS Code's `Position.character` value is a UTF-16 code-unit offset.
 
 The extension does not expose those raw offsets to the user.
 
-Instead, it analyzes the relevant lines by Unicode code point and translates the configured user-facing coordinate semantics into the UTF-16 offsets required by the VS Code API.
+Instead, it analyzes the relevant lines using Unicode grapheme clusters and translates the configured user-facing coordinate semantics into the UTF-16 offsets required by the VS Code API.
 
-This prevents a coordinate from accidentally splitting a Unicode code point such as an emoji represented by a surrogate pair.
+This keeps coordinates aligned with user-perceived character boundaries, including combining sequences, surrogate-pair characters such as many emoji, and multi-code-point grapheme clusters.
 
 ## Requirements
 

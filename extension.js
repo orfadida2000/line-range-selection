@@ -1,6 +1,6 @@
 const vscode = require("vscode");
 
-const COMMAND_NAME = "line-range-selection.selectLineRange";
+const COMMAND_NAME = "precise-line-range-selection.selectLineRange";
 
 /**
  * Supported interpretations of the optional secondary coordinate.
@@ -33,7 +33,7 @@ const CoordinateTarget = Object.freeze({
 
 // --- STRICT REGEXES (final acceptance/parsing) ---
 
-const nonZeroPattern = "-?0*[1-9][0-9]*";
+const nonZeroPattern = "[+-]?0*[1-9][0-9]*";
 const lineSpecifierPattern = `(${nonZeroPattern})(?::(${nonZeroPattern}))?`;
 const lineRangeRegex = new RegExp(`^${lineSpecifierPattern}(?:\\s+${lineSpecifierPattern})?$`);
 
@@ -41,7 +41,7 @@ const strictNonZeroRegex = new RegExp(`^${nonZeroPattern}$`);
 
 // --- PERMISSIVE REGEXES (live typing-state analysis) ---
 
-const permissiveNonZeroPattern = "-?[0-9]*";
+const permissiveNonZeroPattern = "[+-]?[0-9]*";
 const permissiveLineSpecifierPattern = `(${permissiveNonZeroPattern})(:(${permissiveNonZeroPattern}))?`;
 const permissiveLineRangeRegex = new RegExp(
   `^${permissiveLineSpecifierPattern}(?:\\s+${permissiveLineSpecifierPattern})?$`,
@@ -69,7 +69,7 @@ const parseNonZeroComponent = (text) => {
  * position, depending on the configured coordinate mode.
  *
  * @param {string} text
- * @param {string} coordinateMode
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
  * @returns {vscode.InputBoxValidationMessage | undefined}
  */
 const getValidationMessage = (text, coordinateMode) => {
@@ -79,15 +79,13 @@ const getValidationMessage = (text, coordinateMode) => {
     return undefined;
   }
 
-  const coordinateName = coordinateMode === CoordinateMode.CHARACTER ? "character" : "column";
-
   const match = text.match(permissiveLineRangeRegex);
 
   if (!match) {
     return {
       message:
-        `Invalid format. Use '<line>[:<${coordinateName}>] ` +
-        `[<line>[:<${coordinateName}>]]' with non-zero integers.`,
+        `Invalid format. Use '<line>[:<${coordinateMode}>] ` +
+        `[<line>[:<${coordinateMode}>]]' with non-zero integers.`,
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -114,7 +112,7 @@ const getValidationMessage = (text, coordinateMode) => {
 
   if (startCoordinateWithColon !== "" && !startLineData.valid) {
     return {
-      message: `Finish a valid start line before adding a ${coordinateName} number.`,
+      message: `Finish a valid start line before adding a ${coordinateMode} number.`,
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -128,7 +126,7 @@ const getValidationMessage = (text, coordinateMode) => {
 
   if (endCoordinateWithColon !== "" && !endLineData.valid) {
     return {
-      message: `Finish a valid end line before adding a ${coordinateName} number.`,
+      message: `Finish a valid end line before adding a ${coordinateMode} number.`,
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -143,11 +141,11 @@ const getValidationMessage = (text, coordinateMode) => {
   }
 
   const startCoordinateDescription = startCoordinateData.valid
-    ? ` ${coordinateName} ${startCoordinateData.value}`
+    ? ` ${coordinateMode} ${startCoordinateData.value}`
     : "";
 
   const endCoordinateDescription = endCoordinateData.valid
-    ? ` ${coordinateName} ${endCoordinateData.value}`
+    ? ` ${coordinateMode} ${endCoordinateData.value}`
     : "";
 
   let message;
@@ -177,14 +175,12 @@ const getValidationMessage = (text, coordinateMode) => {
  * Informational validation states therefore remain non-blocking visually while
  * Enter is accepted only when the complete value matches the strict grammar.
  *
- * @param {string} coordinateMode
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
  * @returns {Promise<string | undefined>}
  */
 const showLineRangeInputBox = (coordinateMode) =>
   new Promise((resolve) => {
     const inputBox = vscode.window.createInputBox();
-
-    const coordinateName = coordinateMode === CoordinateMode.CHARACTER ? "character" : "column";
 
     const coordinateSemantics =
       coordinateMode === CoordinateMode.CHARACTER
@@ -193,8 +189,8 @@ const showLineRangeInputBox = (coordinateMode) =>
 
     inputBox.title = "Select Line Range";
     inputBox.prompt =
-      `Enter '<line>[:<${coordinateName}>] ` +
-      `[<line>[:<${coordinateName}>]]'. ` +
+      `Enter '<line>[:<${coordinateMode}>] ` +
+      `[<line>[:<${coordinateMode}>]]'. ` +
       "Line numbers are 1-based. " +
       coordinateSemantics +
       "Negative values count from the end of the document or line. " +
@@ -275,55 +271,56 @@ const normalizeAndClipLineNumber = (lineNumber, lineCount) => {
 };
 
 /**
- * Analyze one resolved document line.
+ * Segments strings into user-perceived characters (Unicode grapheme clusters).
  *
- * User-facing coordinates operate on Unicode code-point boundaries, while
- * vscode.Position.character uses UTF-16 code-unit offsets.
+ * Grapheme segmentation keeps sequences such as a base character followed by
+ * combining marks, surrogate-pair characters, and multi-code-point emoji
+ * sequences together as a single character.
+ */
+const graphemeSegmenter = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+
+/**
+ * Analyzes a document line using Unicode grapheme clusters as characters.
  *
- * afterOffsets provides the common translation table used by both coordinate
- * modes:
+ * The returned boundary offsets map user-facing character boundaries to the
+ * UTF-16 offsets required by the VS Code API. Index 0 represents the beginning
+ * of the line, and each subsequent index represents the position immediately
+ * after the corresponding character.
  *
- *   afterOffsets[n] = UTF-16 offset immediately after Unicode code point n
+ * For example, for the decomposed text "éX", where "é" consists of "e"
+ * followed by a combining acute accent, the result contains:
  *
- * afterOffsets[0] is the line-start boundary at UTF-16 offset 0.
+ *   characterCount = 2
+ *   utf16Length = 3
+ *   characterBoundaryOffsets = [0, 2, 3]
  *
- * Therefore:
- *
- *   before character n = afterOffsets[n - 1]
- *   after character n  = afterOffsets[n]
- *
- * and logical column n corresponds to:
- *
- *   n === 1 ? line start : after character (n - 1)
- *
- * JavaScript's string iterator advances by Unicode code point, while each
- * yielded string occupies one or two UTF-16 code units.
- *
- * @param {vscode.TextDocument} document
- * @param {number} lineNumber - Resolved 1-based line number.
+ * @param {vscode.TextDocument} document The document containing the line.
+ * @param {number} lineNumber The 1-based line number to analyze.
  * @returns {{
  *   lineNumber: number,
  *   characterCount: number,
  *   utf16Length: number,
- *   afterOffsets: number[]
- * }}
+ *   characterBoundaryOffsets: number[],
+ * }} Analysis of the line and its UTF-16 character-boundary offsets.
  */
 const analyzeLine = (document, lineNumber) => {
   const text = document.lineAt(lineNumber - 1).text;
 
-  const afterOffsets = [0];
+  const characterBoundaryOffsets = [0];
   let utf16Offset = 0;
 
-  for (const character of text) {
-    utf16Offset += character.length;
-    afterOffsets.push(utf16Offset);
+  for (const { segment } of graphemeSegmenter.segment(text)) {
+    utf16Offset += segment.length;
+    characterBoundaryOffsets.push(utf16Offset);
   }
 
   return {
     lineNumber,
-    characterCount: afterOffsets.length - 1,
+    characterCount: characterBoundaryOffsets.length - 1,
     utf16Length: text.length,
-    afterOffsets,
+    characterBoundaryOffsets,
   };
 };
 
@@ -344,7 +341,7 @@ const analyzeLine = (document, lineNumber) => {
  *
  * @param {number | null} coordinateNumber
  * @param {{ characterCount: number }} lineAnalysis
- * @param {string} coordinateMode
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
  * @returns {number | null}
  */
 const resolveExplicitCoordinate = (coordinateNumber, lineAnalysis, coordinateMode) => {
@@ -419,22 +416,22 @@ const isForwardSelection = (
 /**
  * Get the UTF-16 position immediately before a valid resolved character.
  *
- * @param {{ afterOffsets: number[] }} lineAnalysis
+ * @param {{ characterBoundaryOffsets: number[] }} lineAnalysis
  * @param {number} characterNumber - Valid 1-based character number.
  * @returns {number}
  */
 const getPositionBeforeCharacter = (lineAnalysis, characterNumber) =>
-  lineAnalysis.afterOffsets[characterNumber - 1];
+  lineAnalysis.characterBoundaryOffsets[characterNumber - 1];
 
 /**
  * Get the UTF-16 position immediately after a valid resolved character.
  *
- * @param {{ afterOffsets: number[] }} lineAnalysis
+ * @param {{ characterBoundaryOffsets: number[] }} lineAnalysis
  * @param {number} characterNumber - Valid 1-based character number.
  * @returns {number}
  */
 const getPositionAfterCharacter = (lineAnalysis, characterNumber) =>
-  lineAnalysis.afterOffsets[characterNumber];
+  lineAnalysis.characterBoundaryOffsets[characterNumber];
 
 /**
  * Get the UTF-16 position represented by a valid 1-based logical column.
@@ -442,7 +439,7 @@ const getPositionAfterCharacter = (lineAnalysis, characterNumber) =>
  * Column 1 is the line-start boundary. Any later column n is the position
  * immediately after Unicode code-point character n - 1.
  *
- * @param {{ afterOffsets: number[] }} lineAnalysis
+ * @param {{ characterBoundaryOffsets: number[] }} lineAnalysis
  * @param {number} columnNumber - Valid 1-based logical column number.
  * @returns {number}
  */
@@ -476,12 +473,12 @@ const getPositionAtColumn = (lineAnalysis, columnNumber) => {
  *
  * @param {{
  *   utf16Length: number,
- *   afterOffsets: number[]
+ *   characterBoundaryOffsets: number[]
  * }} lineAnalysis
- * @param {number | string} coordinateTarget
+ * @param {number | (typeof CoordinateTarget)[keyof typeof CoordinateTarget]} coordinateTarget
  * @param {boolean} isStart
  * @param {boolean} forwardSelection
- * @param {string} coordinateMode
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
  * @returns {number}
  */
 const coordinateTargetToPosition = (
@@ -522,7 +519,7 @@ function activate(context) {
     COMMAND_NAME,
     async (/** @type {vscode.TextEditor} */ editor) => {
       const configuredCoordinateMode = vscode.workspace
-        .getConfiguration("line-range-selection", editor.document.uri)
+        .getConfiguration("precise-line-range-selection", editor.document.uri)
         .get("coordinateMode", CoordinateMode.CHARACTER);
 
       const coordinateMode =
