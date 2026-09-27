@@ -1,40 +1,92 @@
 const vscode = require("vscode");
 
-const COMMAND_NAME = "precise-line-range-selection.selectLineRange";
+const COMMAND_NAME = "advanced-line-range-selection.selectLineRange";
+
+const PROPORTION_EPSILON = 1e-12;
 
 /**
- * Supported interpretations of the optional secondary coordinate.
+ * Supported interpretations of an explicit integer secondary coordinate.
  *
  * CHARACTER:
- *   The coordinate is a 1-based Unicode code-point character number.
- *   Explicit character endpoints are inclusive.
+ *   The coordinate is a 1-based user-perceived character number.
+ *   Characters are Unicode grapheme clusters, and explicit character
+ *   endpoints are inclusive.
  *
  * COLUMN:
- *   The coordinate is a 1-based logical text position between Unicode
- *   code points. Column 1 is the beginning of the line, and each Unicode
- *   code point advances the column by one.
+ *   The coordinate is a 1-based text position between Unicode grapheme
+ *   clusters. Column 1 is the beginning of the line.
+ *
+ * Proportional coordinates use separate ".<digits>" syntax and are independent
+ * of this setting.
  */
 const CoordinateMode = Object.freeze({
   CHARACTER: "character",
   COLUMN: "column",
 });
 
-/*
- * Semantic boundary targets used only after selection direction is known.
+/**
+ * Supported snapping behaviors for proportional coordinates.
  *
- * An explicit secondary coordinate remains a positive resolved integer.
- * An omitted or unusable coordinate is initially represented by null and is
- * converted to LINE_START or LINE_END only after direction has been determined.
+ * NEAREST:
+ *   Choose the grapheme boundary nearest to the requested proportion.
+ *   An effective tie resolves to the boundary after the requested position.
+ *
+ * BEFORE:
+ *   Choose the nearest grapheme boundary at or before the requested proportion.
+ *
+ * AFTER:
+ *   Choose the nearest grapheme boundary at or after the requested proportion.
  */
-const CoordinateTarget = Object.freeze({
-  LINE_START: "LINE_START",
-  LINE_END: "LINE_END",
+const ProportionSnap = Object.freeze({
+  NEAREST: "nearest",
+  BEFORE: "before",
+  AFTER: "after",
+});
+
+/**
+ * Kinds of explicit secondary input accepted by a line specifier.
+ */
+const SecondaryInputKind = Object.freeze({
+  COORDINATE: "coordinate",
+  PROPORTION: "proportion",
+});
+
+/**
+ * Internal target kinds used before final conversion to a grapheme boundary.
+ *
+ * CHARACTER:
+ *   Identifies a 1-based grapheme character number. Its final boundary depends
+ *   on selection direction and whether it is the start or end endpoint.
+ *
+ * BOUNDARY:
+ *   Identifies a 0-based grapheme boundary index directly.
+ */
+const TargetKind = Object.freeze({
+  CHARACTER: "character",
+  BOUNDARY: "boundary",
 });
 
 // --- STRICT REGEXES (final acceptance/parsing) ---
 
 const nonZeroPattern = "[+-]?0*[1-9][0-9]*";
-const lineSpecifierPattern = `(${nonZeroPattern})(?::(${nonZeroPattern}))?`;
+
+/*
+ * A specifier is one of:
+ *
+ *   <line>
+ *   <line>:<coordinate>
+ *   <line>.<proportion-digits>
+ *
+ * For proportional syntax:
+ *
+ *   5.     -> proportion 1
+ *   5.0    -> proportion 0
+ *   5.25   -> proportion 0.25
+ *
+ * The digits following "." therefore represent the fractional digits directly.
+ */
+const lineSpecifierPattern = `(${nonZeroPattern})(?::(${nonZeroPattern})|\\.([0-9]*))?`;
+
 const lineRangeRegex = new RegExp(`^${lineSpecifierPattern}(?:\\s+${lineSpecifierPattern})?$`);
 
 const strictNonZeroRegex = new RegExp(`^${nonZeroPattern}$`);
@@ -42,13 +94,16 @@ const strictNonZeroRegex = new RegExp(`^${nonZeroPattern}$`);
 // --- PERMISSIVE REGEXES (live typing-state analysis) ---
 
 const permissiveNonZeroPattern = "[+-]?[0-9]*";
-const permissiveLineSpecifierPattern = `(${permissiveNonZeroPattern})(:(${permissiveNonZeroPattern}))?`;
+
+const permissiveLineSpecifierPattern =
+  `(${permissiveNonZeroPattern})` + `(?:(:(${permissiveNonZeroPattern}))|(\\.([0-9]*)))?`;
+
 const permissiveLineRangeRegex = new RegExp(
-  `^${permissiveLineSpecifierPattern}(?:\\s+${permissiveLineSpecifierPattern})?$`,
+  `^${permissiveLineSpecifierPattern}` + `(?:\\s+${permissiveLineSpecifierPattern})?$`,
 );
 
 /**
- * Parse one numeric component after strict syntactic validation.
+ * Parse one non-zero signed integer component after permissive matching.
  *
  * @param {string} text
  * @returns {{ valid: boolean, value: number }}
@@ -62,11 +117,127 @@ const parseNonZeroComponent = (text) => {
 };
 
 /**
+ * Convert the digits following proportional "." syntax to a proportion.
+ *
+ * An empty digit sequence is the explicit proportion 1.
+ * Otherwise the digits are interpreted as the fractional part of 0.<digits>.
+ *
+ * @param {string} digits
+ * @returns {number}
+ */
+const parseProportionDigits = (digits) => {
+  if (digits === "") {
+    return 1;
+  }
+
+  return Number(`0.${digits}`);
+};
+
+/**
+ * Parse a complete accepted line-range input.
+ *
+ * Each specifier contains a required signed non-zero line number and optionally
+ * either:
+ *
+ * - an integer coordinate introduced by ":";
+ * - a proportion introduced by ".".
+ *
+ * @param {string} text
+ * @returns {{
+ *   startSpecifier: {
+ *     lineNumber: number,
+ *     secondaryInput:
+ *       | null
+ *       | { kind: string, value: number },
+ *   },
+ *   endSpecifier:
+ *     | null
+ *     | {
+ *         lineNumber: number,
+ *         secondaryInput:
+ *           | null
+ *           | { kind: string, value: number },
+ *       },
+ * } | null}
+ */
+const parseLineRangeInput = (text) => {
+  const match = text.trim().match(lineRangeRegex);
+
+  if (!match) {
+    return null;
+  }
+
+  /**
+   * @param {string} lineText
+   * @param {string | undefined} coordinateText
+   * @param {string | undefined} proportionDigits
+   */
+  const buildSpecifier = (lineText, coordinateText, proportionDigits) => {
+    let secondaryInput = null;
+
+    if (coordinateText !== undefined) {
+      secondaryInput = {
+        kind: SecondaryInputKind.COORDINATE,
+        value: parseInt(coordinateText, 10),
+      };
+    } else if (proportionDigits !== undefined) {
+      secondaryInput = {
+        kind: SecondaryInputKind.PROPORTION,
+        value: parseProportionDigits(proportionDigits),
+      };
+    }
+
+    return {
+      lineNumber: parseInt(lineText, 10),
+      secondaryInput,
+    };
+  };
+
+  const startSpecifier = buildSpecifier(match[1], match[2], match[3]);
+
+  const endSpecifier = match[4] === undefined ? null : buildSpecifier(match[4], match[5], match[6]);
+
+  return {
+    startSpecifier,
+    endSpecifier,
+  };
+};
+
+/**
+ * Build a human-readable description of one optional secondary input while
+ * performing live input validation.
+ *
+ * @param {string} coordinateWithColon
+ * @param {{ valid: boolean, value: number }} coordinateData
+ * @param {string} proportionWithDot
+ * @param {string} proportionDigits
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
+ * @returns {string}
+ */
+const getSecondaryInputDescription = (
+  coordinateWithColon,
+  coordinateData,
+  proportionWithDot,
+  proportionDigits,
+  coordinateMode,
+) => {
+  if (coordinateWithColon !== "" && coordinateData.valid) {
+    return ` ${coordinateMode} ${coordinateData.value}`;
+  }
+
+  if (proportionWithDot !== "") {
+    return ` proportion ${parseProportionDigits(proportionDigits)}`;
+  }
+
+  return "";
+};
+
+/**
  * Build the live validation message for the input box.
  *
- * Line numbers are always 1-based. The optional secondary coordinate is either
- * a 1-based Unicode code-point character number or a 1-based logical column
- * position, depending on the configured coordinate mode.
+ * Integer secondary coordinates use ":" and follow the configured coordinate
+ * mode. Proportional secondary coordinates use "." and are independent of the
+ * coordinate mode.
  *
  * @param {string} text
  * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
@@ -84,8 +255,10 @@ const getValidationMessage = (text, coordinateMode) => {
   if (!match) {
     return {
       message:
-        `Invalid format. Use '<line>[:<${coordinateMode}>] ` +
-        `[<line>[:<${coordinateMode}>]]' with non-zero integers.`,
+        `Invalid format. Use '<line>', '<line>:<${coordinateMode}>', or ` +
+        `'<line>.<proportion-digits>' for one or two specifiers. ` +
+        `Lines and ':' ${coordinateMode} numbers must be non-zero signed integers; ` +
+        "a bare '.' means proportion 1.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -93,12 +266,18 @@ const getValidationMessage = (text, coordinateMode) => {
   const startLine = match[1] || "";
   const startCoordinateWithColon = match[2] || "";
   const startCoordinate = match[3] || "";
-  const endLine = match[4] || "";
-  const endCoordinateWithColon = match[5] || "";
-  const endCoordinate = match[6] || "";
+  const startProportionWithDot = match[4] || "";
+  const startProportionDigits = match[5] ?? "";
+
+  const endLine = match[6] || "";
+  const endCoordinateWithColon = match[7] || "";
+  const endCoordinate = match[8] || "";
+  const endProportionWithDot = match[9] || "";
+  const endProportionDigits = match[10] ?? "";
 
   const startLineData = parseNonZeroComponent(startLine);
   const startCoordinateData = parseNonZeroComponent(startCoordinate);
+
   const endLineData = parseNonZeroComponent(endLine);
   const endCoordinateData = parseNonZeroComponent(endCoordinate);
 
@@ -108,11 +287,15 @@ const getValidationMessage = (text, coordinateMode) => {
   const endSpecifierValid =
     endLineData.valid && (endCoordinateWithColon === "" || endCoordinateData.valid);
 
-  const hasStartedEndSpecifier = endLine !== "" || endCoordinateWithColon !== "";
+  const hasStartedEndSpecifier =
+    endLine !== "" || endCoordinateWithColon !== "" || endProportionWithDot !== "";
 
-  if (startCoordinateWithColon !== "" && !startLineData.valid) {
+  if ((startCoordinateWithColon !== "" || startProportionWithDot !== "") && !startLineData.valid) {
     return {
-      message: `Finish a valid start line before adding a ${coordinateMode} number.`,
+      message:
+        startCoordinateWithColon !== ""
+          ? `Finish a valid start line before adding a ${coordinateMode} number.`
+          : "Finish a valid start line before adding a proportion.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -124,9 +307,12 @@ const getValidationMessage = (text, coordinateMode) => {
     };
   }
 
-  if (endCoordinateWithColon !== "" && !endLineData.valid) {
+  if ((endCoordinateWithColon !== "" || endProportionWithDot !== "") && !endLineData.valid) {
     return {
-      message: `Finish a valid end line before adding a ${coordinateMode} number.`,
+      message:
+        endCoordinateWithColon !== ""
+          ? `Finish a valid end line before adding a ${coordinateMode} number.`
+          : "Finish a valid end line before adding a proportion.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -140,27 +326,38 @@ const getValidationMessage = (text, coordinateMode) => {
     };
   }
 
-  const startCoordinateDescription = startCoordinateData.valid
-    ? ` ${coordinateMode} ${startCoordinateData.value}`
-    : "";
+  const startSecondaryDescription = getSecondaryInputDescription(
+    startCoordinateWithColon,
+    startCoordinateData,
+    startProportionWithDot,
+    startProportionDigits,
+    coordinateMode,
+  );
 
-  const endCoordinateDescription = endCoordinateData.valid
-    ? ` ${coordinateMode} ${endCoordinateData.value}`
-    : "";
+  const endSecondaryDescription = getSecondaryInputDescription(
+    endCoordinateWithColon,
+    endCoordinateData,
+    endProportionWithDot,
+    endProportionDigits,
+    coordinateMode,
+  );
 
   let message;
 
   if (hasStartedEndSpecifier) {
     message =
-      `Will select from line ${startLineData.value}${startCoordinateDescription} ` +
-      `to line ${endLineData.value}${endCoordinateDescription}`;
+      `Will select from line ${startLineData.value}` +
+      `${startSecondaryDescription} ` +
+      `to line ${endLineData.value}${endSecondaryDescription}`;
   } else {
     message =
-      `Will select from line ${startLineData.value}${startCoordinateDescription} ` +
-      "to the end of the document";
+      `Will select from line ${startLineData.value}` +
+      `${startSecondaryDescription} to the end of the document`;
   }
 
-  message += " (values are before negative-index normalization and clipping).";
+  message +=
+    ` (line and ${coordinateMode} numbers are shown before ` +
+    "negative-index normalization and clipping).";
 
   return {
     message,
@@ -176,28 +373,44 @@ const getValidationMessage = (text, coordinateMode) => {
  * Enter is accepted only when the complete value matches the strict grammar.
  *
  * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
+ * @param {(typeof ProportionSnap)[keyof typeof ProportionSnap]} proportionSnap
  * @returns {Promise<string | undefined>}
  */
-const showLineRangeInputBox = (coordinateMode) =>
+const showLineRangeInputBox = (coordinateMode, proportionSnap) =>
   new Promise((resolve) => {
     const inputBox = vscode.window.createInputBox();
 
     const coordinateSemantics =
       coordinateMode === CoordinateMode.CHARACTER
-        ? "Character numbers are 1-based Unicode code-point numbers, and explicit character endpoints are inclusive. "
-        : "Column numbers are 1-based logical text positions between Unicode code points; column 1 is the beginning of the line. ";
+        ? "':' character numbers are 1-based user-perceived character numbers, " +
+          "and explicit character endpoints are inclusive. "
+        : "':' column numbers are 1-based text positions between " +
+          "user-perceived characters; column 1 is the beginning of the line. ";
+
+    const proportionSnapSemantics =
+      proportionSnap === ProportionSnap.BEFORE
+        ? "Proportions snap to the nearest grapheme boundary at or before " +
+          "the requested position. "
+        : proportionSnap === ProportionSnap.AFTER
+          ? "Proportions snap to the nearest grapheme boundary at or after " +
+            "the requested position. "
+          : "Proportions snap to the nearest grapheme boundary; ties snap after. ";
 
     inputBox.title = "Select Line Range";
+
     inputBox.prompt =
-      `Enter '<line>[:<${coordinateMode}>] ` +
-      `[<line>[:<${coordinateMode}>]]'. ` +
+      `Enter one or two specifiers using '<line>', ` +
+      `'<line>:<${coordinateMode}>', or '<line>.<proportion-digits>'. ` +
       "Line numbers are 1-based. " +
       coordinateSemantics +
-      "Negative values count from the end of the document or line. " +
-      "An omitted end specifier means the end of the document, " +
-      "and out-of-bounds values are clipped.";
+      "For proportional syntax, '.25' means proportion 0.25, '.0' means " +
+      "the beginning of the line, and a bare '.' means proportion 1. " +
+      proportionSnapSemantics +
+      `Negative line and ${coordinateMode} numbers count from the end. ` +
+      "An omitted end specifier means the end of the document, and " +
+      `out-of-bounds line and ${coordinateMode} numbers are clipped.`;
 
-    inputBox.placeholder = "e.g. 13, 13:2 20, 13 -1:6, 13:5";
+    inputBox.placeholder = "e.g. 13, 13:2 20, 13.25 20.75, 13. -1:6";
 
     /** @type {string | undefined} */
     let acceptedValue;
@@ -237,7 +450,7 @@ const showLineRangeInputBox = (coordinateMode) =>
           return;
         }
 
-        if (!lineRangeRegex.test(value)) {
+        if (parseLineRangeInput(value) === null) {
           return;
         }
 
@@ -271,6 +484,25 @@ const normalizeAndClipLineNumber = (lineNumber, lineCount) => {
 };
 
 /**
+ * Return the effective positive integer tab size for the active editor.
+ *
+ * TextEditor.options reflects the editor's effective tab-size choice, including
+ * file-specific indentation detection when applicable.
+ *
+ * @param {vscode.TextEditor} editor
+ * @returns {number}
+ */
+const getEffectiveTabSize = (editor) => {
+  const tabSize = Number(editor.options.tabSize);
+
+  if (Number.isInteger(tabSize) && tabSize > 0) {
+    return tabSize;
+  }
+
+  return 4;
+};
+
+/**
  * Segments strings into user-perceived characters (Unicode grapheme clusters).
  *
  * Grapheme segmentation keeps sequences such as a base character followed by
@@ -282,122 +514,322 @@ const graphemeSegmenter = new Intl.Segmenter(undefined, {
 });
 
 /**
- * Analyzes a document line using Unicode grapheme clusters as characters.
+ * Analyze one document line in terms of grapheme boundaries.
  *
- * The returned boundary offsets map user-facing character boundaries to the
- * UTF-16 offsets required by the VS Code API. Index 0 represents the beginning
- * of the line, and each subsequent index represents the position immediately
- * after the corresponding character.
+ * Both returned arrays use the same 0-based grapheme boundary index:
  *
- * For example, for the decomposed text "éX", where "é" consists of "e"
- * followed by a combining acute accent, the result contains:
+ *   0 .. graphemeCount
  *
- *   characterCount = 2
- *   utf16Length = 3
- *   characterBoundaryOffsets = [0, 2, 3]
+ * boundaryVscodePositions[k]:
+ *   The numeric value to use as vscode.Position.character for boundary k.
  *
- * @param {vscode.TextDocument} document The document containing the line.
- * @param {number} lineNumber The 1-based line number to analyze.
+ * boundaryLogicalWidths[k]:
+ *   The accumulated logical display width from the beginning of the line to
+ *   boundary k.
+ *
+ * Each non-tab grapheme contributes logical width 1. A tab advances to the
+ * next tab stop according to tabSize.
+ *
+ * For the decomposed text "éX":
+ *
+ *   graphemeCount = 2
+ *   boundaryVscodePositions = [0, 2, 3]
+ *   boundaryLogicalWidths = [0, 1, 2]
+ *
+ * For "A<TAB>B" with tabSize 4:
+ *
+ *   graphemeCount = 3
+ *   boundaryVscodePositions = [0, 1, 2, 3]
+ *   boundaryLogicalWidths = [0, 1, 4, 5]
+ *
+ * @param {vscode.TextDocument} document
+ * @param {number} lineNumber 1-based line number.
+ * @param {number} tabSize
  * @returns {{
  *   lineNumber: number,
- *   characterCount: number,
- *   utf16Length: number,
- *   characterBoundaryOffsets: number[],
- * }} Analysis of the line and its UTF-16 character-boundary offsets.
+ *   graphemeCount: number,
+ *   boundaryVscodePositions: number[],
+ *   boundaryLogicalWidths: number[],
+ * }}
  */
-const analyzeLine = (document, lineNumber) => {
+const analyzeLine = (document, lineNumber, tabSize) => {
   const text = document.lineAt(lineNumber - 1).text;
 
-  const characterBoundaryOffsets = [0];
-  let utf16Offset = 0;
+  const boundaryVscodePositions = [0];
+  const boundaryLogicalWidths = [0];
+
+  let vscodePosition = 0;
+  let logicalWidth = 0;
 
   for (const { segment } of graphemeSegmenter.segment(text)) {
-    utf16Offset += segment.length;
-    characterBoundaryOffsets.push(utf16Offset);
+    vscodePosition += segment.length;
+
+    if (segment === "\t") {
+      logicalWidth += tabSize - (logicalWidth % tabSize);
+    } else {
+      logicalWidth += 1;
+    }
+
+    boundaryVscodePositions.push(vscodePosition);
+    boundaryLogicalWidths.push(logicalWidth);
   }
 
   return {
     lineNumber,
-    characterCount: characterBoundaryOffsets.length - 1,
-    utf16Length: text.length,
-    characterBoundaryOffsets,
+    graphemeCount: boundaryVscodePositions.length - 1,
+    boundaryVscodePositions,
+    boundaryLogicalWidths,
   };
 };
 
 /**
- * Resolve an explicitly supplied signed secondary coordinate.
+ * Normalize and clip a signed 1-based integer coordinate.
  *
- * Character mode:
- *   valid coordinates are 1..characterCount.
- *   An empty line has no valid character coordinate and therefore resolves
- *   an explicit value to null.
+ * Negative values count backward from maximumCoordinate.
  *
- * Column mode:
- *   valid coordinates are 1..characterCount + 1.
- *   Even an empty line therefore has one valid column: column 1.
- *
- * Negative normalization and clipping occur entirely in the corresponding
- * user-facing coordinate domain.
- *
- * @param {number | null} coordinateNumber
- * @param {{ characterCount: number }} lineAnalysis
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
- * @returns {number | null}
+ * @param {number} coordinateNumber
+ * @param {number} maximumCoordinate
+ * @returns {number}
  */
-const resolveExplicitCoordinate = (coordinateNumber, lineAnalysis, coordinateMode) => {
-  if (coordinateNumber === null) {
-    return null;
+const normalizeAndClipCoordinate = (coordinateNumber, maximumCoordinate) => {
+  let resolvedCoordinate =
+    coordinateNumber < 0 ? maximumCoordinate + 1 + coordinateNumber : coordinateNumber;
+
+  if (resolvedCoordinate < 1) {
+    resolvedCoordinate = 1;
+  } else if (resolvedCoordinate > maximumCoordinate) {
+    resolvedCoordinate = maximumCoordinate;
   }
 
+  return resolvedCoordinate;
+};
+
+/**
+ * Resolve an explicit ":" integer coordinate into an internal target.
+ *
+ * Character mode:
+ *   Valid coordinates are 1..graphemeCount.
+ *   An empty line has no valid character target and resolves to null.
+ *
+ * Column mode:
+ *   Valid coordinates are 1..graphemeCount + 1.
+ *   Column n resolves directly to boundary index n - 1.
+ *
+ * @param {number} coordinateNumber
+ * @param {{ graphemeCount: number }} lineAnalysis
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
+ * @returns {{
+ *   kind: string,
+ *   characterNumber?: number,
+ *   boundaryIndex?: number,
+ * } | null}
+ */
+const resolveCoordinateTarget = (coordinateNumber, lineAnalysis, coordinateMode) => {
   const maximumCoordinate =
     coordinateMode === CoordinateMode.CHARACTER
-      ? lineAnalysis.characterCount
-      : lineAnalysis.characterCount + 1;
+      ? lineAnalysis.graphemeCount
+      : lineAnalysis.graphemeCount + 1;
 
   if (maximumCoordinate === 0) {
     return null;
   }
 
-  let resolvedCoordinateNumber =
-    coordinateNumber < 0 ? maximumCoordinate + 1 + coordinateNumber : coordinateNumber;
+  const resolvedCoordinate = normalizeAndClipCoordinate(coordinateNumber, maximumCoordinate);
 
-  if (resolvedCoordinateNumber < 1) {
-    resolvedCoordinateNumber = 1;
-  } else if (resolvedCoordinateNumber > maximumCoordinate) {
-    resolvedCoordinateNumber = maximumCoordinate;
+  if (coordinateMode === CoordinateMode.CHARACTER) {
+    return {
+      kind: TargetKind.CHARACTER,
+      characterNumber: resolvedCoordinate,
+    };
   }
 
-  return resolvedCoordinateNumber;
+  return {
+    kind: TargetKind.BOUNDARY,
+    boundaryIndex: resolvedCoordinate - 1,
+  };
 };
 
 /**
- * Determine selection direction after lines and all usable explicit secondary
- * coordinates have been resolved.
+ * Resolve a proportional coordinate to a grapheme boundary index.
+ *
+ * The user-facing proportion is in [0, 1]. Internally, it is multiplied by the
+ * line's total logical width. Actual selectable boundaries remain represented
+ * by exact accumulated integer logical widths.
+ *
+ * Floating-point tolerance is checked before applying the configured snapping
+ * behavior so a mathematically exact boundary is not accidentally skipped.
+ *
+ * @param {{
+ *   graphemeCount: number,
+ *   boundaryLogicalWidths: number[],
+ * }} lineAnalysis
+ * @param {number} proportion
+ * @param {(typeof ProportionSnap)[keyof typeof ProportionSnap]} proportionSnap
+ * @returns {number} A valid grapheme boundary index.
+ */
+const resolveProportionBoundaryIndex = (lineAnalysis, proportion, proportionSnap) => {
+  const logicalWidths = lineAnalysis.boundaryLogicalWidths;
+
+  const totalLogicalWidth = logicalWidths[lineAnalysis.graphemeCount];
+
+  if (totalLogicalWidth === 0) {
+    return 0;
+  }
+
+  const targetLogicalWidth = proportion * totalLogicalWidth;
+
+  const widthTolerance = PROPORTION_EPSILON * totalLogicalWidth;
+
+  /*
+   * Find the first boundary whose logical width is greater than or equal to
+   * the requested target.
+   */
+  let low = 0;
+  let high = logicalWidths.length - 1;
+
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+
+    if (logicalWidths[middle] < targetLogicalWidth) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  const afterIndex = low;
+
+  const beforeIndex =
+    logicalWidths[afterIndex] > targetLogicalWidth ? Math.max(0, afterIndex - 1) : afterIndex;
+
+  const afterDistance = Math.abs(logicalWidths[afterIndex] - targetLogicalWidth);
+
+  if (afterDistance <= widthTolerance) {
+    return afterIndex;
+  }
+
+  const beforeDistance = Math.abs(targetLogicalWidth - logicalWidths[beforeIndex]);
+
+  if (beforeDistance <= widthTolerance) {
+    return beforeIndex;
+  }
+
+  if (proportionSnap === ProportionSnap.BEFORE) {
+    return beforeIndex;
+  }
+
+  if (proportionSnap === ProportionSnap.AFTER) {
+    return afterIndex;
+  }
+
+  /*
+   * NEAREST is the default. An effective tie deliberately resolves after.
+   */
+  if (Math.abs(beforeDistance - afterDistance) <= widthTolerance) {
+    return afterIndex;
+  }
+
+  return beforeDistance < afterDistance ? beforeIndex : afterIndex;
+};
+
+/**
+ * Resolve one explicit secondary input into an internal target.
+ *
+ * Integer ":" coordinates are interpreted according to coordinateMode.
+ * Proportional "." coordinates always resolve directly to a boundary target.
+ *
+ * @param {{
+ *   kind: string,
+ *   value: number,
+ * }} secondaryInput
+ * @param {{
+ *   graphemeCount: number,
+ *   boundaryLogicalWidths: number[],
+ * }} lineAnalysis
+ * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
+ * @param {(typeof ProportionSnap)[keyof typeof ProportionSnap]} proportionSnap
+ * @returns {{
+ *   kind: string,
+ *   characterNumber?: number,
+ *   boundaryIndex?: number,
+ * } | null}
+ */
+const resolveExplicitTarget = (secondaryInput, lineAnalysis, coordinateMode, proportionSnap) => {
+  if (secondaryInput.kind === SecondaryInputKind.PROPORTION) {
+    return {
+      kind: TargetKind.BOUNDARY,
+      boundaryIndex: resolveProportionBoundaryIndex(
+        lineAnalysis,
+        secondaryInput.value,
+        proportionSnap,
+      ),
+    };
+  }
+
+  return resolveCoordinateTarget(secondaryInput.value, lineAnalysis, coordinateMode);
+};
+
+/**
+ * Return a common ordering value for an explicit target on one line.
+ *
+ * Grapheme boundaries and grapheme characters interleave as:
+ *
+ *   B0 < C1 < B1 < C2 < B2 < ...
+ *
+ * Mapping them to integers gives:
+ *
+ *   boundary k  -> 2k
+ *   character n -> 2n - 1
+ *
+ * This allows character targets and boundary targets to participate in the
+ * same direction comparison before character targets are converted to their
+ * final inclusive boundaries.
+ *
+ * @param {{
+ *   kind: string,
+ *   characterNumber?: number,
+ *   boundaryIndex?: number,
+ * }} target
+ * @returns {number}
+ */
+const getTargetOrder = (target) => {
+  if (target.kind === TargetKind.BOUNDARY) {
+    return target.boundaryIndex * 2;
+  }
+
+  return target.characterNumber * 2 - 1;
+};
+
+/**
+ * Determine selection direction after line numbers and all usable explicit
+ * targets have been resolved.
  *
  * Different resolved line numbers determine direction directly.
  *
- * On the same resolved line, the explicit secondary coordinates determine
- * direction only when both are available. Equality is considered forward.
+ * On the same line, explicit targets determine direction only when both are
+ * available. Character and boundary targets are compared using their common
+ * interleaved ordering.
  *
- * In character mode, equal coordinates later produce a one-character
- * selection. In column mode, equal coordinates later produce equal VS Code
- * positions and therefore a no-op.
+ * Equality is considered forward.
  *
- * If either coordinate target is null on the same line, the selection is
- * defined as forward.
+ * If either target is null on the same line, the selection defaults to
+ * forward.
  *
  * @param {number} startLineNumber
  * @param {number} endLineNumber
- * @param {number | null} startCoordinateTarget
- * @param {number | null} endCoordinateTarget
+ * @param {{
+ *   kind: string,
+ *   characterNumber?: number,
+ *   boundaryIndex?: number,
+ * } | null} startTarget
+ * @param {{
+ *   kind: string,
+ *   characterNumber?: number,
+ *   boundaryIndex?: number,
+ * } | null} endTarget
  * @returns {boolean}
  */
-const isForwardSelection = (
-  startLineNumber,
-  endLineNumber,
-  startCoordinateTarget,
-  endCoordinateTarget,
-) => {
+const isForwardSelection = (startLineNumber, endLineNumber, startTarget, endTarget) => {
   if (startLineNumber < endLineNumber) {
     return true;
   }
@@ -406,239 +838,256 @@ const isForwardSelection = (
     return false;
   }
 
-  if (startCoordinateTarget !== null && endCoordinateTarget !== null) {
-    return startCoordinateTarget <= endCoordinateTarget;
+  if (startTarget !== null && endTarget !== null) {
+    return getTargetOrder(startTarget) <= getTargetOrder(endTarget);
   }
 
   return true;
 };
 
 /**
- * Get the UTF-16 position immediately before a valid resolved character.
+ * Resolve one endpoint to a concrete grapheme boundary index.
  *
- * @param {{ characterBoundaryOffsets: number[] }} lineAnalysis
- * @param {number} characterNumber - Valid 1-based character number.
- * @returns {number}
- */
-const getPositionBeforeCharacter = (lineAnalysis, characterNumber) =>
-  lineAnalysis.characterBoundaryOffsets[characterNumber - 1];
-
-/**
- * Get the UTF-16 position immediately after a valid resolved character.
+ * Boundary targets already identify an exact boundary and therefore do not
+ * depend on selection direction or endpoint role.
  *
- * @param {{ characterBoundaryOffsets: number[] }} lineAnalysis
- * @param {number} characterNumber - Valid 1-based character number.
- * @returns {number}
- */
-const getPositionAfterCharacter = (lineAnalysis, characterNumber) =>
-  lineAnalysis.characterBoundaryOffsets[characterNumber];
-
-/**
- * Get the UTF-16 position represented by a valid 1-based logical column.
- *
- * Column 1 is the line-start boundary. Any later column n is the position
- * immediately after Unicode code-point character n - 1.
- *
- * @param {{ characterBoundaryOffsets: number[] }} lineAnalysis
- * @param {number} columnNumber - Valid 1-based logical column number.
- * @returns {number}
- */
-const getPositionAtColumn = (lineAnalysis, columnNumber) => {
-  if (columnNumber === 1) {
-    return 0;
-  }
-
-  return getPositionAfterCharacter(lineAnalysis, columnNumber - 1);
-};
-
-/**
- * Convert one fully resolved semantic coordinate target into the UTF-16
- * character offset expected by vscode.Position.
- *
- * LINE_START and LINE_END map directly to physical line boundaries in both
- * modes.
- *
- * Character mode uses inclusive explicit character endpoints:
+ * Character targets use inclusive endpoint semantics:
  *
  * Forward:
- *   start -> before(start character)
- *   end   -> after(end character)
+ *   start character n -> boundary n - 1
+ *   end character n   -> boundary n
  *
  * Backward:
- *   start -> after(start character)
- *   end   -> before(end character)
+ *   start character n -> boundary n
+ *   end character n   -> boundary n - 1
  *
- * Column mode already specifies a text boundary directly, so selection
- * direction and endpoint role do not affect conversion.
+ * A null target represents an omitted or unusable secondary coordinate:
+ *
+ * Forward:
+ *   start -> line-start boundary 0
+ *   end   -> line-end boundary graphemeCount
+ *
+ * Backward:
+ *   start -> line-end boundary graphemeCount
+ *   end   -> line-start boundary 0
  *
  * @param {{
- *   utf16Length: number,
- *   characterBoundaryOffsets: number[]
+ *   graphemeCount: number,
  * }} lineAnalysis
- * @param {number | (typeof CoordinateTarget)[keyof typeof CoordinateTarget]} coordinateTarget
+ * @param {{
+ *   kind: string,
+ *   characterNumber?: number,
+ *   boundaryIndex?: number,
+ * } | null} target
  * @param {boolean} isStart
  * @param {boolean} forwardSelection
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
  * @returns {number}
  */
-const coordinateTargetToPosition = (
-  lineAnalysis,
-  coordinateTarget,
-  isStart,
-  forwardSelection,
-  coordinateMode,
-) => {
-  if (coordinateTarget === CoordinateTarget.LINE_START) {
-    return 0;
+const resolveTargetBoundaryIndex = (lineAnalysis, target, isStart, forwardSelection) => {
+  if (target === null) {
+    if (isStart) {
+      return forwardSelection ? 0 : lineAnalysis.graphemeCount;
+    }
+
+    return forwardSelection ? lineAnalysis.graphemeCount : 0;
   }
 
-  if (coordinateTarget === CoordinateTarget.LINE_END) {
-    return lineAnalysis.utf16Length;
-  }
-
-  if (coordinateMode === CoordinateMode.COLUMN) {
-    return getPositionAtColumn(lineAnalysis, coordinateTarget);
+  if (target.kind === TargetKind.BOUNDARY) {
+    return target.boundaryIndex;
   }
 
   if (isStart) {
-    return forwardSelection
-      ? getPositionBeforeCharacter(lineAnalysis, coordinateTarget)
-      : getPositionAfterCharacter(lineAnalysis, coordinateTarget);
+    return forwardSelection ? target.characterNumber - 1 : target.characterNumber;
   }
 
-  return forwardSelection
-    ? getPositionAfterCharacter(lineAnalysis, coordinateTarget)
-    : getPositionBeforeCharacter(lineAnalysis, coordinateTarget);
+  return forwardSelection ? target.characterNumber : target.characterNumber - 1;
 };
+
+/**
+ * Translate one valid grapheme boundary index to the numeric
+ * vscode.Position.character value for that boundary.
+ *
+ * The valid boundary-index domain is:
+ *
+ *   0 .. graphemeCount
+ *
+ * @param {{
+ *   boundaryVscodePositions: number[],
+ * }} lineAnalysis
+ * @param {number} boundaryIndex
+ * @returns {number}
+ */
+const getVscodePositionIndex = (lineAnalysis, boundaryIndex) =>
+  lineAnalysis.boundaryVscodePositions[boundaryIndex];
 
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
-  const disposable = vscode.commands.registerTextEditorCommand(
+  const disposable = vscode.commands.registerCommand(
     COMMAND_NAME,
-    async (/** @type {vscode.TextEditor} */ editor) => {
-      const configuredCoordinateMode = vscode.workspace
-        .getConfiguration("precise-line-range-selection", editor.document.uri)
-        .get("coordinateMode", CoordinateMode.CHARACTER);
+    async (
+      /** @type {string | undefined} */
+      rangeInput,
+    ) => {
+      const editor = vscode.window.activeTextEditor;
+
+      if (editor === undefined) {
+        return;
+      }
+
+      const configuration = vscode.workspace.getConfiguration(
+        "advanced-line-range-selection",
+        editor.document.uri,
+      );
+
+      const configuredCoordinateMode = configuration.get(
+        "coordinateMode",
+        CoordinateMode.CHARACTER,
+      );
 
       const coordinateMode =
         configuredCoordinateMode === CoordinateMode.COLUMN
           ? CoordinateMode.COLUMN
           : CoordinateMode.CHARACTER;
 
-      const input = await showLineRangeInputBox(coordinateMode);
+      const configuredProportionSnap = configuration.get("proportionSnap", ProportionSnap.NEAREST);
 
-      if (input === undefined) {
-        return;
+      const proportionSnap =
+        configuredProportionSnap === ProportionSnap.BEFORE
+          ? ProportionSnap.BEFORE
+          : configuredProportionSnap === ProportionSnap.AFTER
+            ? ProportionSnap.AFTER
+            : ProportionSnap.NEAREST;
+
+      let input;
+
+      if (rangeInput === undefined) {
+        input = await showLineRangeInputBox(coordinateMode, proportionSnap);
+
+        if (input === undefined) {
+          return;
+        }
+      } else {
+        if (typeof rangeInput !== "string") {
+          return;
+        }
+
+        input = rangeInput;
       }
 
-      const match = input.match(lineRangeRegex);
-
-      // Defensive invariant: accepted input should always satisfy the strict
-      // grammar because showLineRangeInputBox() checks it before hiding.
-      if (!match) {
-        return;
-      }
+      const parsedInput = parseLineRangeInput(input);
 
       /*
-       * Raw parsed values.
-       *
-       * Explicit zero is impossible by grammar, so null can safely represent an
-       * omitted line or secondary-coordinate component.
+       * Defensive check
        */
-      const startLineInput = parseInt(match[1], 10);
-      const startCoordinateInput = match[2] !== undefined ? parseInt(match[2], 10) : null;
-      const endLineInput = match[3] !== undefined ? parseInt(match[3], 10) : null;
-      const endCoordinateInput = match[4] !== undefined ? parseInt(match[4], 10) : null;
+      if (parsedInput === null) {
+        return;
+      }
 
       const document = editor.document;
       const lineCount = document.lineCount;
+      const tabSize = getEffectiveTabSize(editor);
 
-      // ---------------------------------------------------------------------
+      // -------------------------------------------------------------------
       // Stage 1: Resolve start/end line numbers.
-      // ---------------------------------------------------------------------
+      // -------------------------------------------------------------------
 
-      const startLineNumber = normalizeAndClipLineNumber(startLineInput, lineCount);
+      const startLineNumber = normalizeAndClipLineNumber(
+        parsedInput.startSpecifier.lineNumber,
+        lineCount,
+      );
 
       const endLineNumber =
-        endLineInput === null ? lineCount : normalizeAndClipLineNumber(endLineInput, lineCount);
+        parsedInput.endSpecifier === null
+          ? lineCount
+          : normalizeAndClipLineNumber(parsedInput.endSpecifier.lineNumber, lineCount);
 
-      // ---------------------------------------------------------------------
-      // Stage 2: Analyze the resolved boundary lines and resolve only
-      // explicitly supplied secondary coordinates.
-      // ---------------------------------------------------------------------
+      // -------------------------------------------------------------------
+      // Stage 2: Analyze the resolved endpoint lines.
+      // -------------------------------------------------------------------
 
-      const startLineAnalysis = analyzeLine(document, startLineNumber);
+      const startLineAnalysis = analyzeLine(document, startLineNumber, tabSize);
 
       const endLineAnalysis =
         endLineNumber === startLineNumber
           ? startLineAnalysis
-          : analyzeLine(document, endLineNumber);
+          : analyzeLine(document, endLineNumber, tabSize);
 
-      let startCoordinateTarget = resolveExplicitCoordinate(
-        startCoordinateInput,
-        startLineAnalysis,
-        coordinateMode,
-      );
+      // -------------------------------------------------------------------
+      // Stage 3: Resolve explicitly supplied secondary inputs to semantic
+      // targets. Omitted or unusable targets remain null until direction is
+      // known.
+      // -------------------------------------------------------------------
 
-      let endCoordinateTarget = resolveExplicitCoordinate(
-        endCoordinateInput,
-        endLineAnalysis,
-        coordinateMode,
-      );
+      const startTarget =
+        parsedInput.startSpecifier.secondaryInput === null
+          ? null
+          : resolveExplicitTarget(
+              parsedInput.startSpecifier.secondaryInput,
+              startLineAnalysis,
+              coordinateMode,
+              proportionSnap,
+            );
 
-      // ---------------------------------------------------------------------
-      // Stage 3: Determine direction, then resolve remaining null coordinate
-      // targets to semantic line boundaries.
-      // ---------------------------------------------------------------------
+      const endTarget =
+        parsedInput.endSpecifier === null || parsedInput.endSpecifier.secondaryInput === null
+          ? null
+          : resolveExplicitTarget(
+              parsedInput.endSpecifier.secondaryInput,
+              endLineAnalysis,
+              coordinateMode,
+              proportionSnap,
+            );
+
+      // -------------------------------------------------------------------
+      // Stage 4: Determine direction while character targets and boundary
+      // targets still retain their distinct semantics.
+      // -------------------------------------------------------------------
 
       const forwardSelection = isForwardSelection(
         startLineNumber,
         endLineNumber,
-        startCoordinateTarget,
-        endCoordinateTarget,
+        startTarget,
+        endTarget,
       );
 
-      if (startCoordinateTarget === null) {
-        startCoordinateTarget = forwardSelection
-          ? CoordinateTarget.LINE_START
-          : CoordinateTarget.LINE_END;
-      }
+      // -------------------------------------------------------------------
+      // Stage 5: Resolve both endpoints to concrete grapheme boundary
+      // indices.
+      // -------------------------------------------------------------------
 
-      if (endCoordinateTarget === null) {
-        endCoordinateTarget = forwardSelection
-          ? CoordinateTarget.LINE_END
-          : CoordinateTarget.LINE_START;
-      }
-
-      // ---------------------------------------------------------------------
-      // Stage 4: Translate semantic endpoints into VS Code positions.
-      // ---------------------------------------------------------------------
-
-      const startCharacterPosition = coordinateTargetToPosition(
+      const startBoundaryIndex = resolveTargetBoundaryIndex(
         startLineAnalysis,
-        startCoordinateTarget,
+        startTarget,
         true,
         forwardSelection,
-        coordinateMode,
       );
 
-      const endCharacterPosition = coordinateTargetToPosition(
+      const endBoundaryIndex = resolveTargetBoundaryIndex(
         endLineAnalysis,
-        endCoordinateTarget,
+        endTarget,
         false,
         forwardSelection,
-        coordinateMode,
       );
+
+      // -------------------------------------------------------------------
+      // Stage 6: Translate grapheme boundary indices to the UTF-16 numeric
+      // positions required by vscode.Position.
+      // -------------------------------------------------------------------
+
+      const startCharacterPosition = getVscodePositionIndex(startLineAnalysis, startBoundaryIndex);
+
+      const endCharacterPosition = getVscodePositionIndex(endLineAnalysis, endBoundaryIndex);
 
       const startPos = new vscode.Position(startLineNumber - 1, startCharacterPosition);
 
       const endPos = new vscode.Position(endLineNumber - 1, endCharacterPosition);
 
-      // If both semantic endpoints resolve to the same physical VS Code
-      // position, there is no text to select. Test the final positions directly
-      // because that is the invariant that matters in both coordinate modes.
+      /*
+       * If both endpoints resolve to the same physical VS Code position,
+       * there is no text to select.
+       */
       if (startPos.isEqual(endPos)) {
         return;
       }

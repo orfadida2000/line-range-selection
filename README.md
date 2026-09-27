@@ -1,169 +1,261 @@
-# Precise Line Range Selection
+# Advanced Line Range Selection
 
-Select text ranges in Visual Studio Code by entering line numbers with optional secondary coordinates.
+**Advanced Line Range Selection** is a focused Visual Studio Code extension for selecting exact text ranges using human-readable line coordinates.
 
-The extension supports:
+It supports:
 
-- 1-based line numbers
-- Negative indexing from the end
-- Automatic clipping of out-of-range values
-- Forward and backward selections
-- Unicode-aware coordinates
-- Two configurable coordinate modes:
-  - **Character mode** — inclusive user-perceived character numbers
-  - **Column mode** — logical text positions between user-perceived characters
-- Selection to the end of the document when the end specifier is omitted
+- 1-based line numbers;
+- optional character or column coordinates;
+- proportional positions within a line;
+- negative indexing from the end of the document or line;
+- Unicode grapheme-cluster-aware character and column semantics;
+- inclusive explicit character endpoints;
+- forward and backward selections;
+- automatic clipping of out-of-bounds integer coordinates;
+- configurable proportional-position snapping;
+- tab-aware logical width for proportional positions;
+- interactive input with live validation;
+- direct programmatic invocation without opening the input box;
+- Command Palette, editor context-menu, and keyboard access.
 
 ## Installation
 
-### Visual Studio Code
+Install **Advanced Line Range Selection** from the Visual Studio Code Extensions view, or use:
 
-Install **Precise Line Range Selection** from the Visual Studio Code Extensions view:
-
-1. Open the Extensions view.
-2. Search for **Precise Line Range Selection**.
-3. Select the extension published by **Or Fadida**.
-4. Click **Install**.
-
-### Command Line
-
-You can also install the extension using the VS Code CLI:
-
-```text
-code --install-extension orfadida.precise-line-range-selection
+```sh
+code --install-extension orfadida.advanced-line-range-selection
 ```
 
 To uninstall it:
 
-```text
-code --uninstall-extension orfadida.precise-line-range-selection
+```sh
+code --uninstall-extension orfadida.advanced-line-range-selection
 ```
+
+## Command
+
+| Command               | ID                                              |
+| --------------------- | ----------------------------------------------- |
+| **Select Line Range** | `advanced-line-range-selection.selectLineRange` |
+
+The normal UI entry points are available when a text editor has focus.
 
 ## Usage
 
-Run:
+Run **Advanced Line Range Selection: Select Line Range** and enter either one line specifier or a start/end pair.
 
-**Precise Line Range Selection: Select Line Range**
-
-from the Command Palette or editor context menu, or use the default keybinding:
-
-| Platform        | Keybinding      |
-| --------------- | --------------- |
-| Windows / Linux | `Ctrl+[ Ctrl+]` |
-| macOS           | `Cmd+[ Cmd+]`   |
-
-Enter a range using:
+A line specifier has one of these forms:
 
 ```text
-<line>[:<coordinate>] [<line>[:<coordinate>]]
+<line>
+<line>:<coordinate>
+<line>.<proportion-digits>
 ```
 
-The two line specifiers are separated by whitespace.
+For `:` syntax, `<coordinate>` is interpreted as either a **character** or a **column** according to the configured coordinate mode.
 
-Examples:
+A complete input is:
 
 ```text
-13
-13:5
-13 20
-13:5 20:8
-20:8 13:5
--1
--5:2 -1:4
+<start-specifier> [<end-specifier>]
 ```
 
-A hyphen is used only as the sign of a negative number. It is not a range separator.
+The two specifiers are separated by whitespace.
 
-## Line Numbers
+The `:` and `.` forms intentionally use different coordinate systems:
 
-Line numbers are always 1-based.
+- `:` introduces an integer character or column number, according to `coordinateMode`;
+- `.` introduces a proportional position within the line and is independent of `coordinateMode`.
 
-For example:
+### Basic examples
+
+The following examples assume the default `character` coordinate mode.
+
+| Input         | Meaning                                                                                         |
+| ------------- | ----------------------------------------------------------------------------------------------- |
+| `13`          | Select from the beginning of line 13 to the end of the document.                                |
+| `13:5`        | Select from character 5 of line 13 through the end of the document.                             |
+| `13 20`       | Select from the beginning of line 13 through the end of line 20.                                |
+| `13:2 20:8`   | Select from character 2 of line 13 through character 8 of line 20, inclusive.                   |
+| `20 13`       | Select the same full-line range as `13 20`, but backward.                                       |
+| `20:8 13:2`   | Select the same explicit character range as `13:2 20:8`, but backward.                          |
+| `2:3 2:3`     | Select exactly character 3 on line 2.                                                           |
+| `13.25`       | Select from 25% of the logical width of line 13 through the end of the document.                |
+| `13.25 20.75` | Select between proportional positions on lines 13 and 20.                                       |
+| `13:5 20.75`  | Mix an integer character coordinate with a proportional position.                               |
+| `13.`         | Start at the explicit end boundary of line 13 and select through the end of the document.       |
+| `13.0`        | Start at the explicit beginning boundary of line 13 and select through the end of the document. |
+
+When the end specifier is omitted entirely, the selection extends to the end of the document.
+
+## Input Syntax
+
+### Line numbers
+
+A line number is a non-zero signed integer:
 
 ```text
 1
+25
++25
+-1
+-20
 ```
 
-refers to the first line.
+Leading zeros are allowed:
+
+```text
+001
++005
+-010
+```
+
+Zero is invalid:
+
+```text
+0
++0
+-0
+```
 
 Negative line numbers count backward from the end of the document:
 
 ```text
--1
+-1 = last line
+-2 = second-to-last line
+...
 ```
 
-refers to the last line,
+After negative indexing is resolved, out-of-bounds line numbers are clipped to the document.
+
+### Integer `:` coordinates
+
+The `:` form requires a non-zero signed integer after the colon:
 
 ```text
--2
+13:5
+13:+5
+13:-1
 ```
 
-to the second-to-last line, and so on.
+A colon without a coordinate is not complete input:
 
-After negative indexing is resolved, out-of-range line numbers are clipped to the document.
+```text
+13:
+```
 
-For example, a value before the first line resolves to line 1, while a value beyond the last line resolves to the last line.
+The interpretation of the integer is controlled by:
+
+```text
+advanced-line-range-selection.coordinateMode
+```
+
+Negative character or column numbers count backward from the end of their respective coordinate domain.
+
+After negative indexing is resolved, out-of-bounds character or column numbers are clipped to the valid range of the line.
+
+### Proportional `.` positions
+
+The digits following `.` represent the fractional digits of a proportion between `0` and `1`.
+
+For example:
+
+```text
+13.0      -> proportion 0
+13.1      -> proportion 0.1
+13.25     -> proportion 0.25
+13.500    -> proportion 0.5
+13.999    -> proportion 0.999
+```
+
+A bare dot represents the exact proportion `1`:
+
+```text
+13.       -> proportion 1
+```
+
+Therefore:
+
+```text
+13
+```
+
+and:
+
+```text
+13.
+```
+
+are not equivalent.
+
+`13` has no explicit secondary position, so its eventual line boundary depends on selection direction.
+
+`13.` explicitly identifies the end boundary of line 13.
+
+Negative proportional values are not supported. A negative sign before the line still applies to the line number, so:
+
+```text
+-1.5
+```
+
+means proportion `0.5` of the last line.
+
+## Unicode Grapheme Clusters
+
+Character and column coordinates operate on **Unicode grapheme clusters**, which correspond closely to user-perceived characters.
+
+For example, the decomposed text:
+
+```text
+éX
+```
+
+contains two grapheme clusters:
+
+```text
+1 = é
+2 = X
+```
+
+even though the first grapheme consists of `e` followed by a combining acute accent.
+
+Likewise:
+
+```text
+A👨‍👩‍👧‍👦B
+```
+
+contains three grapheme clusters:
+
+```text
+1 = A
+2 = 👨‍👩‍👧‍👦
+3 = B
+```
+
+Internally, the extension maps grapheme boundaries to the UTF-16 positions required by the VS Code `Position` API.
 
 ## Coordinate Modes
 
-The optional secondary coordinate is controlled by:
+The setting:
+
+```text
+advanced-line-range-selection.coordinateMode
+```
+
+controls only integer coordinates introduced by `:`.
+
+It does not affect proportional positions introduced by `.`.
+
+### Character mode
+
+The default mode is:
 
 ```json
-"precise-line-range-selection.coordinateMode": "character"
+"advanced-line-range-selection.coordinateMode": "character"
 ```
 
-Supported values are:
-
-```text
-character
-column
-```
-
-The default is:
-
-```text
-character
-```
-
-Both modes operate on Unicode **grapheme clusters**, which correspond to user-perceived characters rather than UTF-16 code units or individual Unicode code points.
-
-For example, the line:
-
-```text
-A😀B
-```
-
-contains three user-perceived characters:
-
-```text
-1: A
-2: 😀
-3: B
-```
-
-Likewise, a combining sequence such as:
-
-```text
-é
-```
-
-where the displayed character may internally consist of `e` followed by a combining acute accent, is treated as one character.
-
-Multi-code-point emoji sequences are also treated as a single character when Unicode grapheme segmentation defines them as one grapheme cluster.
-
-### Character Mode
-
-Configure:
-
-```json
-"precise-line-range-selection.coordinateMode": "character"
-```
-
-The secondary coordinate is a **1-based user-perceived character number**.
-
-Characters are determined using Unicode grapheme-cluster boundaries.
-
-Explicit character endpoints are inclusive.
+A `:` coordinate identifies a 1-based grapheme character number.
 
 For:
 
@@ -171,16 +263,18 @@ For:
 ABCDEF
 ```
 
-the characters are:
+the character numbers are:
 
 ```text
-1: A
-2: B
-3: C
-4: D
-5: E
-6: F
+1 = A
+2 = B
+3 = C
+4 = D
+5 = E
+6 = F
 ```
+
+Explicit character endpoints are inclusive.
 
 For example:
 
@@ -188,13 +282,13 @@ For example:
 2:1 2:3
 ```
 
-selects characters 1 through 3 on line 2:
+selects:
 
 ```text
 ABC
 ```
 
-Likewise:
+The reverse input:
 
 ```text
 2:3 2:1
@@ -202,33 +296,19 @@ Likewise:
 
 selects the same text backward.
 
-If both explicit endpoints refer to the same character:
+Negative character numbers count backward from the end of the line.
 
-```text
-2:3 2:3
-```
+An empty line has no valid explicit character target.
 
-that character is selected.
+### Column mode
 
-For a line such as:
-
-```text
-éX
-```
-
-the displayed `é` is treated as character 1 and `X` as character 2, even if `é` is internally represented by multiple Unicode code points.
-
-### Column Mode
-
-Configure:
+Column mode is enabled with:
 
 ```json
-"precise-line-range-selection.coordinateMode": "column"
+"advanced-line-range-selection.coordinateMode": "column"
 ```
 
-The secondary coordinate is a **1-based logical text position between user-perceived characters**.
-
-Column 1 is the beginning of the line. Every Unicode grapheme cluster advances the logical column by exactly one.
+A column identifies a 1-based boundary between grapheme clusters.
 
 For:
 
@@ -236,235 +316,298 @@ For:
 ABC
 ```
 
-the logical columns are:
+the columns are:
 
 ```text
-Column 1: before A
-Column 2: after A / before B
-Column 3: after B / before C
-Column 4: after C
+Column 1 = before A
+Column 2 = between A and B
+Column 3 = between B and C
+Column 4 = after C
 ```
+
+A line containing `N` grapheme clusters therefore has `N + 1` columns.
+
+Columns identify boundaries directly. They are not inclusive character endpoints and do not change meaning according to selection direction.
+
+Negative columns count backward from the final boundary.
+
+An empty line still has one valid column: column `1`.
+
+Column mode is a logical grapheme-boundary coordinate system. It is not VS Code's rendered visual-column measurement.
+
+A tab is one grapheme and therefore advances by one column in this coordinate mode.
+
+## Proportional Positions
+
+A proportional position identifies a point along the line's **logical width**.
+
+Examples:
+
+```text
+5.0    -> beginning of line 5
+5.25   -> 25% of line 5
+5.5    -> 50% of line 5
+5.75   -> 75% of line 5
+5.     -> end of line 5
+```
+
+Proportional positions always resolve to grapheme boundaries.
+
+They are independent of `coordinateMode`, so the same proportional input has the same meaning in character and column mode.
+
+### Logical width
+
+Every non-tab grapheme cluster contributes a logical width of `1`.
+
+For example:
+
+```text
+ABCDE
+```
+
+has cumulative grapheme-boundary widths:
+
+```text
+0, 1, 2, 3, 4, 5
+```
+
+A proportion of `0.4` targets logical width:
+
+```text
+0.4 * 5 = 2
+```
+
+which exactly matches the boundary after `B`.
+
+### Tabs
+
+Tabs are treated specially for proportional positions.
+
+A tab advances to the next tab stop according to the editor's effective tab size.
 
 For:
 
 ```text
-A😀B
+A<TAB>B
 ```
 
-the logical columns are:
+with a tab size of `4`, the cumulative logical widths are:
 
 ```text
-Column 1: before A
-Column 2: after A / before 😀
-Column 3: after 😀 / before B
-Column 4: after B
+0, 1, 4, 5
 ```
 
-Likewise, for:
+This logical-width model is deterministic and does not attempt to reproduce rendered pixel width.
+
+Non-tab grapheme clusters, including emoji and wide characters, each contribute logical width `1`.
+
+### Proportional snapping
+
+A requested proportional position may fall between two selectable grapheme boundaries.
+
+The setting:
 
 ```text
-éX
+advanced-line-range-selection.proportionSnap
 ```
 
-the logical columns are:
+controls which boundary is selected.
+
+| Value     | Behavior                                                                                                    |
+| --------- | ----------------------------------------------------------------------------------------------------------- |
+| `nearest` | Select the nearest grapheme boundary. Equal-distance ties select the boundary after the requested position. |
+| `before`  | Select the nearest grapheme boundary at or before the requested position.                                   |
+| `after`   | Select the nearest grapheme boundary at or after the requested position.                                    |
+
+The default is:
+
+```json
+"advanced-line-range-selection.proportionSnap": "nearest"
+```
+
+If the requested position effectively matches an existing grapheme boundary, that boundary is used regardless of the snapping mode.
+
+An empty line has only one boundary, so every proportional position resolves to that boundary.
+
+## Omitted Secondary Positions
+
+A line specifier does not need a character, column, or proportional position.
+
+For example:
 
 ```text
-Column 1: before é
-Column 2: after é / before X
-Column 3: after X
+13 20
 ```
 
-A user-perceived character therefore advances the logical column by one regardless of how many Unicode code points or UTF-16 code units are required to represent it internally.
+contains two line-only specifiers.
 
-Tabs behave the same way: a literal tab advances the logical column by one. This mode does **not** use VS Code's visual/status-bar column calculation and is independent of `tabSize`.
-
-If both explicit endpoints specify the same column:
-
-```text
-2:3 2:3
-```
-
-both endpoints identify the same text position, so there is nothing to select and the command performs no selection.
-
-An empty line has one valid logical column:
-
-```text
-Column 1
-```
-
-which is both the beginning and end of that line.
-
-## Negative Coordinates
-
-Negative secondary coordinates count backward from the end of the relevant coordinate domain.
-
-In character mode, a line containing `N` user-perceived characters has valid character numbers:
-
-```text
-1 .. N
-```
-
-so:
-
-```text
--1
-```
-
-means the last character.
-
-In column mode, the same line has valid logical columns:
-
-```text
-1 .. N + 1
-```
-
-so:
-
-```text
--1
-```
-
-means the final position after the last character.
-
-After negative indexing is resolved, coordinates outside the valid range are clipped.
-
-## Omitted Coordinates
-
-An omitted secondary coordinate refers to the appropriate line boundary based on selection direction.
+An omitted secondary position is resolved only after the selection direction is known.
 
 For a forward selection:
 
-- an omitted start coordinate means the beginning of the start line;
-- an omitted end coordinate means the end of the end line.
+- omitted start position -> beginning of the start line;
+- omitted end position -> end of the end line.
 
 For a backward selection:
 
-- an omitted start coordinate means the end of the start line;
-- an omitted end coordinate means the beginning of the end line.
+- omitted start position -> end of the start line;
+- omitted end position -> beginning of the end line.
 
-For example:
-
-```text
-5 10
-```
-
-selects forward from the beginning of line 5 through the end of line 10.
-
-Likewise:
+This makes line-only ranges symmetric:
 
 ```text
-10 5
+13 20
 ```
 
-selects backward from the end of line 10 to the beginning of line 5.
-
-## Omitted End Specifier
-
-If the entire end specifier is omitted, the selection extends to the end of the document.
-
-For example:
+and:
 
 ```text
-13
+20 13
 ```
 
-selects from the beginning of line 13 through the end of the document.
+select the same text with opposite selection directions.
 
-In character mode:
-
-```text
-13:5
-```
-
-selects from character 5 on line 13, including that character, through the end of the document.
-
-In column mode:
-
-```text
-13:5
-```
-
-selects from logical column 5 on line 13 through the end of the document.
+When both resolved line numbers are the same and at least one endpoint does not provide a usable explicit target, the selection is treated as forward.
 
 ## Selection Direction
 
-Direction is determined after line numbers and usable explicit coordinates have been normalized and clipped.
+Direction is determined after line numbers and explicit secondary positions have been resolved.
 
-If the resolved start line is before the resolved end line, the selection is forward.
+The rules are:
 
-If the resolved start line is after the resolved end line, the selection is backward.
+1. If the resolved start line is before the resolved end line, the selection is forward.
+2. If the resolved start line is after the resolved end line, the selection is backward.
+3. If both resolved lines are the same and both endpoints have explicit usable targets, their positions within the line determine the direction.
+4. Equality is considered forward.
+5. If both resolved lines are the same and either endpoint has no usable explicit target, the selection is forward.
 
-If both endpoints are on the same resolved line and both explicit coordinates are available:
+Character targets and boundary targets can be mixed on the same line.
 
-- start coordinate less than or equal to end coordinate → forward;
-- start coordinate greater than end coordinate → backward.
+Their ordering follows:
 
-If either coordinate is omitted or otherwise unavailable on the same line, the selection defaults to forward.
+```text
+line start
+character 1
+boundary after character 1
+character 2
+boundary after character 2
+...
+line end
+```
 
-The original direction is preserved in the resulting VS Code selection, including which endpoint is the active cursor position.
+This allows character coordinates and boundary-based column or proportional positions to determine direction consistently.
+
+The first resolved endpoint becomes the VS Code selection anchor. The second becomes the active endpoint.
 
 ## Empty Lines
 
-Character mode has no actual character number on an empty line.
+An empty line contains zero grapheme clusters but still has one grapheme boundary.
 
-If an explicit character number resolves to an empty line, it is treated as having no usable character target. The final endpoint is then resolved to the appropriate line boundary after selection direction is known.
+The coordinate types behave as follows:
 
-Column mode has exactly one valid coordinate on an empty line:
+- character mode has no valid explicit character;
+- column mode has exactly one valid column, column `1`;
+- every proportional position resolves to the line's only boundary.
 
-```text
-Column 1
-```
+If an explicit character coordinate resolves to an empty line, there is no character to target. That endpoint is therefore treated like an omitted secondary position.
 
-Both the beginning and end of an empty line map to the same physical VS Code position.
+If both final VS Code positions are identical, the command performs no selection change.
 
-If both final endpoints resolve to the same position, the command performs no selection.
+A completely empty document is handled by the same rules.
 
 ## Input Validation
 
-The input must contain one or two line specifiers:
+Interactive use employs a managed VS Code input box with separate live validation and strict acceptance.
+
+### Live validation
+
+As you type, the extension distinguishes between:
+
+- complete valid input;
+- incomplete input that can still become valid;
+- structurally invalid input.
+
+Incomplete input uses informational guidance such as:
 
 ```text
-<line>[:<coordinate>] [<line>[:<coordinate>]]
+Keep typing...
 ```
 
-Each numeric component must be a non-zero signed integer.
+rather than an error state.
 
-Valid examples include:
+### Strict acceptance
+
+Pressing Enter only accepts input that matches the complete grammar.
+
+Leading and trailing whitespace are ignored.
+
+Leading zeros are accepted for non-zero integer components:
 
 ```text
-1
-+1
-001
-+01
--1
--001
-15:3
-15:-2
+005
++005
+005:003
+005:-003
 ```
 
-Zero is not valid:
+The following integer forms are invalid:
 
 ```text
 0
 +0
 -0
-15:0
+5:
 ```
 
-Leading zeros are allowed and are normalized numerically.
+Zero is valid in proportional syntax:
 
-The input box performs live validation while typing and only accepts a complete value that matches the range grammar.
+```text
+5.0
+```
+
+A bare proportional dot is also complete input:
+
+```text
+5.
+```
+
+## Programmatic Invocation
+
+The command can also be invoked directly with a range string.
+
+When a string argument is supplied, the command skips the input box and sends the string through the same parser and range-resolution logic used by interactive input.
+
+For example, another extension can invoke:
+
+```js
+await vscode.commands.executeCommand("advanced-line-range-selection.selectLineRange", "13:2 20.75");
+```
+
+A keybinding can also pass a fixed range:
+
+```json
+{
+  "key": "ctrl+alt+r",
+  "command": "advanced-line-range-selection.selectLineRange",
+  "args": "13:2 20.75",
+  "when": "editorTextFocus"
+}
+```
+
+If no argument is supplied, the normal interactive input box is shown.
+
+If the supplied argument is not a string, or if the string does not match the accepted input grammar, the command performs no selection change.
+
+Programmatic invocation operates on the current active text editor. If there is no active text editor, the command returns without making a change.
 
 ## Configuration
 
-### `precise-line-range-selection.coordinateMode`
+### Coordinate mode
 
-Controls how the optional secondary coordinate is interpreted.
-
-Type:
+Setting:
 
 ```text
-string
+advanced-line-range-selection.coordinateMode
 ```
 
 Default:
@@ -473,55 +616,104 @@ Default:
 character
 ```
 
-Allowed values:
+Available values:
 
-| Value       | Meaning                                                                    |
-| ----------- | -------------------------------------------------------------------------- |
-| `character` | 1-based user-perceived character numbers with inclusive explicit endpoints |
-| `column`    | 1-based logical text positions between user-perceived characters           |
+| Value       | Meaning                                                                                       |
+| ----------- | --------------------------------------------------------------------------------------------- |
+| `character` | `:` numbers identify 1-based grapheme characters. Explicit character endpoints are inclusive. |
+| `column`    | `:` numbers identify 1-based grapheme boundaries.                                             |
 
-Example:
+### Proportional snapping
 
-```json
-{
-  "precise-line-range-selection.coordinateMode": "column"
-}
+Setting:
+
+```text
+advanced-line-range-selection.proportionSnap
 ```
 
-## Unicode and VS Code Positions
+Default:
 
-VS Code's `Position.character` value is a UTF-16 code-unit offset.
+```text
+nearest
+```
 
-The extension does not expose those raw offsets to the user.
+Available values:
 
-Instead, it analyzes the relevant lines using Unicode grapheme clusters and translates the configured user-facing coordinate semantics into the UTF-16 offsets required by the VS Code API.
+| Value     | Meaning                                                           |
+| --------- | ----------------------------------------------------------------- |
+| `nearest` | Snap to the nearest grapheme boundary; ties snap after.           |
+| `before`  | Snap to the nearest boundary at or before the requested position. |
+| `after`   | Snap to the nearest boundary at or after the requested position.  |
 
-This keeps coordinates aligned with user-perceived character boundaries, including combining sequences, surrogate-pair characters such as many emoji, and multi-code-point grapheme clusters.
+Both settings are resource-scoped.
+
+## Keyboard Shortcut
+
+| Platform        | Shortcut               |
+| --------------- | ---------------------- |
+| Windows / Linux | `Ctrl+[` then `Ctrl+]` |
+| macOS           | `Cmd+[` then `Cmd+]`   |
+
+The shortcut is active when a text editor has focus.
+
+## Other Ways to Run the Command
+
+The command is also available from:
+
+- **Command Palette** -> `Advanced Line Range Selection: Select Line Range`
+- **Editor context menu** -> `Select Line Range`
+
+The editor context-menu entry is placed in the selection group.
 
 ## Requirements
 
-Visual Studio Code:
+- Visual Studio Code `1.68.0` or later.
 
-```text
-1.68.0 or newer
-```
+The extension has no external runtime dependencies.
 
 ## Development
 
-Install dependencies:
+Install development dependencies:
 
-```text
+```sh
 npm install
 ```
 
 Package the extension:
 
-```text
+```sh
 npm run package
 ```
 
-Other versioned publishing scripts are available through `package.json`.
+Publish the current version:
+
+```sh
+npm run publish
+```
+
+The package manifest also provides semantic-version publishing scripts:
+
+```sh
+npm run publish:patch
+npm run publish:minor
+npm run publish:major
+```
+
+Publishing requires the normal Visual Studio Marketplace publisher credentials and `vsce` authentication.
+
+## Repository
+
+- [GitHub repository](https://github.com/orfadida2000/advanced-line-range-selection)
+- [Issues](https://github.com/orfadida2000/advanced-line-range-selection/issues)
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License.<br>
+See **[LICENSE](LICENSE)** for details.
+
+## Author
+
+- **Name:** Or Fadida
+- **Email:** [or@fadida.net](mailto:or@fadida.net)
+- **GitHub:** [orfadida2000](https://github.com/orfadida2000)
+- **Marketplace:** [orfadida](https://marketplace.visualstudio.com/publishers/orfadida)

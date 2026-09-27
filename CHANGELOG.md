@@ -1,8 +1,25 @@
 # Changelog
 
-All notable changes to **Precise Line Range Selection** will be documented in this file.
+All notable changes to **Advanced Line Range Selection** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
+
+## [1.1.0]
+
+### Added
+
+- Added proportional line positions using `<line>.<proportion>` syntax, independent of the configured integer coordinate mode.
+- Added `advanced-line-range-selection.proportionSnap` with `nearest`, `before`, and `after` snapping modes for proportional positions.
+- Proportional positions use accumulated logical line width and snap to Unicode grapheme boundaries, with tabs advancing to the next editor tab stop.
+- Added non-interactive command invocation: `advanced-line-range-selection.selectLineRange` now accepts an optional range string argument, allowing programmatic use without opening the input box.
+
+### Changed
+
+- Renamed the extension from **Precise Line Range Selection** to **Advanced Line Range Selection**.
+- Changed the extension package identifier from `precise-line-range-selection` to `advanced-line-range-selection`.
+- Changed the command identifier from `precise-line-range-selection.selectLineRange` to `advanced-line-range-selection.selectLineRange`.
+- Changed the configuration setting from `precise-line-range-selection.coordinateMode` to `advanced-line-range-selection.coordinateMode`.
+- Refactored endpoint resolution around Unicode grapheme boundaries so character, column, and proportional positions share a common boundary representation.
 
 ## [1.0.0]
 
