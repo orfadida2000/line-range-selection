@@ -2,7 +2,7 @@
   "name": "advanced-line-range-selection",
   "displayName": "Advanced Line Range Selection",
   "description": "Select text ranges using line numbers with character, column, or proportional positions, negative indexing, Unicode grapheme-aware boundaries, and configurable snapping.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "icon": "assets/icon.png",
   "publisher": "orfadida",
   "author": {
