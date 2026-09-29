@@ -4,6 +4,23 @@ All notable changes to **Advanced Line Range Selection** will be documented in t
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0]
+
+### Added
+
+- Added current-line-relative line references: `@` targets the primary active-caret line captured when the command starts, while `@+n` and `@-n` apply non-zero relative line offsets.
+- Added support for `:` integer coordinates and `.` proportional positions directly on `@` references, such as `@:5`, `@+3:2`, and `@-2.75`.
+- Added multiple comma-separated ranges in one command, producing multiple VS Code selections while preserving input order and per-range selection direction.
+- Added persistent per-document interactive input history with previous/next navigation, bounded storage, deduplication, draft restoration, and coordinate-mode-aware filtering.
+- Added canonical history normalization for integer syntax while preserving relative `@` semantics and proportional digit text.
+
+### Changed
+
+- Interactive and programmatic input now share the same multi-range parser; every non-empty comma-separated range must be valid for the command to execute.
+- Live validation now allows transitional incomplete input only in the last non-empty range; earlier ranges must be complete before another range is started.
+- Repeated endpoint-line analysis is cached within each command invocation when resolving multiple ranges.
+- Zero-length resolved ranges are skipped individually; other valid ranges in the same command can still create selections.
+
 ## [1.1.0]
 
 ### Added

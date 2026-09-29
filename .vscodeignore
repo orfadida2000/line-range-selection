@@ -3,6 +3,7 @@ vsc-extension-quickstart.md
 assets/*.png
 !assets/icon.png
 assets/preview/**
+types/**
 
 # Git
 .git/**
@@ -69,4 +70,5 @@ Thumbs.db
 
 # JavaScript related config files
 **/.eslintrc.json
+**/eslint.config.mjs
 **/jsconfig.json

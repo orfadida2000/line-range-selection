@@ -4,17 +4,20 @@
 
 It supports:
 
-- 1-based line numbers;
+- 1-based absolute line numbers;
+- current-line-relative references using `@`, `@+n`, and `@-n`;
 - optional character or column coordinates;
 - proportional positions within a line;
 - negative indexing from the end of the document or line;
 - Unicode grapheme-cluster-aware character and column semantics;
 - inclusive explicit character endpoints;
 - forward and backward selections;
+- multiple comma-separated ranges in one command;
 - automatic clipping of out-of-bounds integer coordinates;
 - configurable proportional-position snapping;
 - tab-aware logical width for proportional positions;
 - interactive input with live validation;
+- persistent per-file interactive input history;
 - direct programmatic invocation without opening the input box;
 - Command Palette, editor context-menu, and keyboard access.
 
@@ -42,57 +45,80 @@ The normal UI entry points are available when a text editor has focus.
 
 ## Usage
 
-Run **Advanced Line Range Selection: Select Line Range** and enter either one line specifier or a start/end pair.
+Run **Advanced Line Range Selection: Select Line Range** and enter one or more ranges separated by commas.
 
-A line specifier has one of these forms:
-
-```text
-<line>
-<line>:<coordinate>
-<line>.<proportion-digits>
-```
-
-For `:` syntax, `<coordinate>` is interpreted as either a **character** or a **column** according to the configured coordinate mode.
-
-A complete input is:
+Each range contains either one line specifier or a start/end pair:
 
 ```text
 <start-specifier> [<end-specifier>]
 ```
 
-The two specifiers are separated by whitespace.
+A line specifier has one of these forms:
+
+```text
+<line-reference>
+<line-reference>:<coordinate>
+<line-reference>.<proportion-digits>
+```
+
+A `<line-reference>` is either:
+
+- an absolute non-zero signed line number, such as `13`, `+13`, or `-1`;
+- `@` for the current primary-caret line;
+- `@+n` or `@-n` for a non-zero offset from that line.
+
+For `:` syntax, `<coordinate>` is interpreted as either a **character** or a **column** according to the configured coordinate mode.
 
 The `:` and `.` forms intentionally use different coordinate systems:
 
 - `:` introduces an integer character or column number, according to `coordinateMode`;
-- `.` introduces a proportional position within the line and is independent of `coordinateMode`.
+- `.` introduces a proportional position within the resolved line and is independent of `coordinateMode`.
+
+Multiple ranges use:
+
+```text
+<range> [, <range>]...
+```
+
+Each non-empty range creates one VS Code selection. Range order is preserved, so the first resulting selection is the primary selection.
 
 ### Basic examples
 
 The following examples assume the default `character` coordinate mode.
 
-| Input         | Meaning                                                                                         |
-| ------------- | ----------------------------------------------------------------------------------------------- |
-| `13`          | Select from the beginning of line 13 to the end of the document.                                |
-| `13:5`        | Select from character 5 of line 13 through the end of the document.                             |
-| `13 20`       | Select from the beginning of line 13 through the end of line 20.                                |
-| `13:2 20:8`   | Select from character 2 of line 13 through character 8 of line 20, inclusive.                   |
-| `20 13`       | Select the same full-line range as `13 20`, but backward.                                       |
-| `20:8 13:2`   | Select the same explicit character range as `13:2 20:8`, but backward.                          |
-| `2:3 2:3`     | Select exactly character 3 on line 2.                                                           |
-| `13.25`       | Select from 25% of the logical width of line 13 through the end of the document.                |
-| `13.25 20.75` | Select between proportional positions on lines 13 and 20.                                       |
-| `13:5 20.75`  | Mix an integer character coordinate with a proportional position.                               |
-| `13.`         | Start at the explicit end boundary of line 13 and select through the end of the document.       |
-| `13.0`        | Start at the explicit beginning boundary of line 13 and select through the end of the document. |
+| Input                        | Meaning                                                                                         |
+| ---------------------------- | ----------------------------------------------------------------------------------------------- |
+| `13`                         | Select from the beginning of line 13 to the end of the document.                                |
+| `13:5`                       | Select from character 5 of line 13 through the end of the document.                             |
+| `13 20`                      | Select from the beginning of line 13 through the end of line 20.                                |
+| `13:2 20:8`                  | Select from character 2 of line 13 through character 8 of line 20, inclusive.                   |
+| `20 13`                      | Select the same full-line range as `13 20`, but backward.                                       |
+| `20:8 13:2`                  | Select the same explicit character range as `13:2 20:8`, but backward.                          |
+| `2:3 2:3`                    | Select exactly character 3 on line 2.                                                           |
+| `13.25`                      | Select from 25% of the logical width of line 13 through the end of the document.                |
+| `13.25 20.75`                | Select between proportional positions on lines 13 and 20.                                       |
+| `13:5 20.75`                 | Mix an integer character coordinate with a proportional position.                               |
+| `13.`                        | Start at the explicit end boundary of line 13 and select through the end of the document.       |
+| `13.0`                       | Start at the explicit beginning boundary of line 13 and select through the end of the document. |
+| `@`                          | Select from the beginning of the current primary-caret line to the end of the document.         |
+| `@-2 @+2`                    | Select from two lines above the current line through two lines below it.                        |
+| `@:5`                        | Start at character 5 of the current line.                                                       |
+| `@-2.25 @+2.75`              | Select between proportional positions on lines relative to the current line.                    |
+| `13:2 20, @-2.25 @+2.75, 30` | Create three selections in one command.                                                         |
 
-When the end specifier is omitted entirely, the selection extends to the end of the document.
+When the end specifier of a range is omitted entirely, that range extends to the end of the document.
 
 ## Input Syntax
 
-### Line numbers
+### Line references
 
-A line number is a non-zero signed integer:
+Every line specifier begins with a line reference.
+
+A line reference can be either an **absolute line number** or a **current-line-relative reference**.
+
+#### Absolute line numbers
+
+An absolute line number is a non-zero signed integer:
 
 ```text
 1
@@ -118,7 +144,7 @@ Zero is invalid:
 -0
 ```
 
-Negative line numbers count backward from the end of the document:
+Negative absolute line numbers count backward from the end of the document:
 
 ```text
 -1 = last line
@@ -126,7 +152,66 @@ Negative line numbers count backward from the end of the document:
 ...
 ```
 
-After negative indexing is resolved, out-of-bounds line numbers are clipped to the document.
+After negative indexing is resolved, out-of-bounds absolute line numbers are clipped to the document.
+
+#### Current-line-relative references
+
+`@` refers to the line containing the **active endpoint of the primary selection** when the command starts.
+
+```text
+@       = current line
+@+5     = five lines after the current line
+@-3     = three lines before the current line
+```
+
+The offset form requires an explicit sign and a non-zero integer magnitude. Leading zeros are allowed:
+
+```text
+@+005
+@-003
+```
+
+Use bare `@` for zero offset. These signed zero-offset forms are invalid:
+
+```text
+@+0
+@-0
+```
+
+All `@` references in one command use the same captured current line, even when the input contains multiple ranges.
+
+A relative reference is calculated from that captured line and then clipped directly to the document bounds. It is not reinterpreted as negative indexing from the end of the document.
+
+A current-line reference can use either secondary-position syntax directly:
+
+```text
+@:5
+@.25
+@+5:3
+@-2.75
+```
+
+### Multiple ranges
+
+One command can contain multiple comma-separated ranges:
+
+```text
+13:2 20, @-2.25 @+2.75, 30
+```
+
+Each non-empty range is parsed independently and creates one selection.
+
+Range order is preserved. The first resulting selection becomes VS Code's primary selection.
+
+Empty comma-separated parts are ignored, so:
+
+```text
+13:2 20,, @:5,
+```
+
+contains two non-empty ranges.
+
+Every non-empty range must be complete and valid before the input can be accepted.
 
 ### Integer `:` coordinates
 
@@ -431,7 +516,7 @@ An empty line has only one boundary, so every proportional position resolves to 
 
 ## Omitted Secondary Positions
 
-A line specifier does not need a character, column, or proportional position.
+A line specifier does not need a character, column, or proportional position; this applies to both absolute and `@` line references.
 
 For example:
 
@@ -497,7 +582,9 @@ line end
 
 This allows character coordinates and boundary-based column or proportional positions to determine direction consistently.
 
-The first resolved endpoint becomes the VS Code selection anchor. The second becomes the active endpoint.
+For each range, the first resolved endpoint becomes that VS Code selection's anchor and the second becomes its active endpoint.
+
+When multiple ranges are supplied, their resulting selections are assigned to `editor.selections` in input order. VS Code then applies its normal multiple-selection behavior, including its configured handling of overlapping selections.
 
 ## Empty Lines
 
@@ -511,7 +598,7 @@ The coordinate types behave as follows:
 
 If an explicit character coordinate resolves to an empty line, there is no character to target. That endpoint is therefore treated like an omitted secondary position.
 
-If both final VS Code positions are identical, the command performs no selection change.
+If both final VS Code positions for a range are identical, that zero-length range is skipped. If every range is skipped, the command performs no selection change.
 
 A completely empty document is handled by the same rules.
 
@@ -535,19 +622,24 @@ Keep typing...
 
 rather than an error state.
 
+With multiple ranges, a transitional incomplete state is allowed only in the last non-empty range. Once another non-empty range has been started, every earlier range must already be complete.
+
 ### Strict acceptance
 
-Pressing Enter only accepts input that matches the complete grammar.
+Pressing Enter only accepts the input when every non-empty comma-separated range matches the complete grammar.
 
-Leading and trailing whitespace are ignored.
+Leading and trailing whitespace around the complete input and individual ranges are ignored. Empty comma-separated parts are ignored.
 
 Leading zeros are accepted for non-zero integer components:
 
 ```text
 005
 +005
+-005
 005:003
 005:-003
+@+005
+@-003
 ```
 
 The following integer forms are invalid:
@@ -557,48 +649,101 @@ The following integer forms are invalid:
 +0
 -0
 5:
+@+0
+@-0
 ```
+
+Bare `@` is valid and means zero relative line offset.
 
 Zero is valid in proportional syntax:
 
 ```text
 5.0
+@.0
 ```
 
 A bare proportional dot is also complete input:
 
 ```text
 5.
+@.
 ```
+
+## Input History
+
+Interactive use keeps a persistent, bounded history for each document.
+
+History is navigated directly from the input box with the **Previous history entry** and **Next history entry** buttons. The buttons appear when compatible history exists for the current file.
+
+Each history entry represents the complete accepted comma-separated command input, not the individual ranges inside it.
+
+History entries are stored in canonical form:
+
+- integer absolute line numbers and `:` coordinates are normalized numerically;
+- `@` remains `@`;
+- positive relative offsets keep the required `+`, while their integer magnitude is normalized;
+- negative relative offsets retain `-`, with leading zeros removed;
+- proportional digits remain textual;
+- range order is preserved.
+
+For example:
+
+```text
++0005:+003 0010, @-0002.2500
+```
+
+is recalled as:
+
+```text
+5:3 10, @-2.2500
+```
+
+Duplicate history entries are moved to the newest position instead of being stored repeatedly.
+
+History is coordinate-mode-aware:
+
+- an entry containing at least one `:` coordinate is available only when the current `coordinateMode` matches the mode under which it was executed;
+- an entry containing no `:` coordinates is available in both character and column modes.
+
+When history navigation starts, the current editable text is preserved as a draft. Moving forward past the newest history entry restores that draft.
+
+Only successfully executed **interactive** inputs are added to this history. Programmatic command arguments are not added.
 
 ## Programmatic Invocation
 
-The command can also be invoked directly with a range string.
+The command can also be invoked directly with an input string.
 
 When a string argument is supplied, the command skips the input box and sends the string through the same parser and range-resolution logic used by interactive input.
+
+The argument can use absolute line references, `@` references, secondary coordinates, proportional positions, and multiple comma-separated ranges.
 
 For example, another extension can invoke:
 
 ```js
-await vscode.commands.executeCommand("advanced-line-range-selection.selectLineRange", "13:2 20.75");
+await vscode.commands.executeCommand(
+  "advanced-line-range-selection.selectLineRange",
+  "13:2 20.75, @-2 @+2",
+);
 ```
 
-A keybinding can also pass a fixed range:
+A keybinding can also pass a fixed input:
 
 ```json
 {
   "key": "ctrl+alt+r",
   "command": "advanced-line-range-selection.selectLineRange",
-  "args": "13:2 20.75",
+  "args": "13:2 20.75, @-2 @+2",
   "when": "editorTextFocus"
 }
 ```
 
 If no argument is supplied, the normal interactive input box is shown.
 
-If the supplied argument is not a string, or if the string does not match the accepted input grammar, the command performs no selection change.
+If the supplied argument is not a string, or if any non-empty range in the string does not match the accepted input grammar, the command performs no selection change.
 
 Programmatic invocation operates on the current active text editor. If there is no active text editor, the command returns without making a change.
+
+Programmatic invocations do not add entries to the interactive input history.
 
 ## Configuration
 

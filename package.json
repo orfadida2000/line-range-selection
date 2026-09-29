@@ -98,8 +98,7 @@
     "menus": {
       "commandPalette": [
         {
-          "command": "advanced-line-range-selection.selectLineRange",
-          "when": "editorTextFocus"
+          "command": "advanced-line-range-selection.selectLineRange"
         }
       ],
       "editor/context": [

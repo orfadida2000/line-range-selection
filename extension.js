@@ -1,8 +1,31 @@
+/**
+ * @import {
+ *   CoordinateMode,
+ *   HistoryEntry,
+ *   LineAnalysis,
+ *   LineAnalysisCache,
+ *   LineRange,
+ *   LineRangeValidation,
+ *   LineReference,
+ *   LineSpecifier,
+ *   NonZeroComponentResult,
+ *   ParsedLineRange,
+ *   ParsedLineRangesInput,
+ *   ProportionSnap,
+ *   ResolvedLineRange,
+ *   SecondaryInput,
+ *   SelectionTarget,
+ * } from "./types/range-types"
+ */
+
 const vscode = require("vscode");
 
 const COMMAND_NAME = "advanced-line-range-selection.selectLineRange";
 
 const PROPORTION_EPSILON = 1e-12;
+
+const HISTORY_LIMIT = 10;
+const HISTORY_STORAGE_PREFIX = "advanced-line-range-selection.history:";
 
 /**
  * Supported interpretations of an explicit integer secondary coordinate.
@@ -44,6 +67,22 @@ const ProportionSnap = Object.freeze({
 });
 
 /**
+ * Kinds of line references accepted by a line specifier.
+ *
+ * ABSOLUTE:
+ *   A signed non-zero 1-based document line number. Negative values count from
+ *   the end of the document.
+ *
+ * CURRENT:
+ *   The line containing the primary active caret when the command starts,
+ *   optionally shifted by a signed non-zero line offset.
+ */
+const LineReferenceKind = Object.freeze({
+  ABSOLUTE: "absolute",
+  CURRENT: "current",
+});
+
+/**
  * Kinds of explicit secondary input accepted by a line specifier.
  */
 const SecondaryInputKind = Object.freeze({
@@ -69,34 +108,50 @@ const TargetKind = Object.freeze({
 // --- STRICT REGEXES (final acceptance/parsing) ---
 
 const nonZeroPattern = "[+-]?0*[1-9][0-9]*";
+const relativeLineOffsetPattern = "[+-]0*[1-9][0-9]*";
+const lineReferencePattern = `(?:${nonZeroPattern}|@(?:${relativeLineOffsetPattern})?)`;
 
 /*
  * A specifier is one of:
  *
- *   <line>
- *   <line>:<coordinate>
- *   <line>.<proportion-digits>
+ *   <line-reference>
+ *   <line-reference>:<coordinate>
+ *   <line-reference>.<proportion-digits>
+ *
+ * A line reference is either an absolute line number or:
+ *
+ *   @       -> current line
+ *   @+5     -> five lines after the current line
+ *   @-3     -> three lines before the current line
+ *
+ * Zero relative offsets are intentionally rejected. Use "@" for the current
+ * line itself.
  *
  * For proportional syntax:
  *
- *   5.     -> proportion 1
- *   5.0    -> proportion 0
- *   5.25   -> proportion 0.25
+ *   5.      -> proportion 1
+ *   5.0     -> proportion 0
+ *   5.25    -> proportion 0.25
+ *   @.5     -> proportion 0.5 of the current line
+ *   @+5.25  -> proportion 0.25 of the line five lines after the current line
  *
- * The digits following "." therefore represent the fractional digits directly.
+ * The line reference is always resolved first; the optional secondary position
+ * is then interpreted within that resolved line.
  */
-const lineSpecifierPattern = `(${nonZeroPattern})(?::(${nonZeroPattern})|\\.([0-9]*))?`;
+const lineSpecifierPattern = `(${lineReferencePattern})(?::(${nonZeroPattern})|\\.([0-9]*))?`;
 
 const lineRangeRegex = new RegExp(`^${lineSpecifierPattern}(?:\\s+${lineSpecifierPattern})?$`);
 
 const strictNonZeroRegex = new RegExp(`^${nonZeroPattern}$`);
+const strictLineReferenceRegex = new RegExp(`^${lineReferencePattern}$`);
 
 // --- PERMISSIVE REGEXES (live typing-state analysis) ---
 
 const permissiveNonZeroPattern = "[+-]?[0-9]*";
+const permissiveLineReferencePattern = `(?:${permissiveNonZeroPattern}|@(?:[+-][0-9]*)?)`;
 
 const permissiveLineSpecifierPattern =
-  `(${permissiveNonZeroPattern})` + `(?:(:(${permissiveNonZeroPattern}))|(\\.([0-9]*)))?`;
+  `(${permissiveLineReferencePattern})` + `(?:(:(${permissiveNonZeroPattern}))|(\\.([0-9]*)))?`;
 
 const permissiveLineRangeRegex = new RegExp(
   `^${permissiveLineSpecifierPattern}` + `(?:\\s+${permissiveLineSpecifierPattern})?$`,
@@ -106,7 +161,7 @@ const permissiveLineRangeRegex = new RegExp(
  * Parse one non-zero signed integer component after permissive matching.
  *
  * @param {string} text
- * @returns {{ valid: boolean, value: number }}
+ * @returns {NonZeroComponentResult}
  */
 const parseNonZeroComponent = (text) => {
   if (!strictNonZeroRegex.test(text)) {
@@ -134,73 +189,210 @@ const parseProportionDigits = (digits) => {
 };
 
 /**
- * Parse a complete accepted line-range input.
+ * Build one parsed line reference after strict syntactic validation.
  *
- * Each specifier contains a required signed non-zero line number and optionally
- * either:
+ * @param {string} lineReferenceText
+ * @returns {LineReference}
+ */
+const buildLineReference = (lineReferenceText) => {
+  if (lineReferenceText.startsWith("@")) {
+    return {
+      kind: LineReferenceKind.CURRENT,
+      offset: lineReferenceText === "@" ? 0 : parseInt(lineReferenceText.slice(1), 10),
+    };
+  }
+
+  return {
+    kind: LineReferenceKind.ABSOLUTE,
+    lineNumber: parseInt(lineReferenceText, 10),
+  };
+};
+
+/**
+ * Build one parsed range specifier after strict syntactic validation.
+ *
+ * @param {string} lineReferenceText
+ * @param {string | undefined} coordinateText
+ * @param {string | undefined} proportionDigits
+ * @returns {LineSpecifier}
+ */
+const buildSpecifier = (lineReferenceText, coordinateText, proportionDigits) => {
+  /** @type {SecondaryInput | null} */
+  let secondaryInput = null;
+
+  if (coordinateText !== undefined) {
+    secondaryInput = {
+      kind: SecondaryInputKind.COORDINATE,
+      value: parseInt(coordinateText, 10),
+    };
+  } else if (proportionDigits !== undefined) {
+    secondaryInput = {
+      kind: SecondaryInputKind.PROPORTION,
+      value: parseProportionDigits(proportionDigits),
+    };
+  }
+
+  return {
+    lineReference: buildLineReference(lineReferenceText),
+    secondaryInput,
+  };
+};
+
+/**
+ * Build the canonical textual form of one strictly valid line reference.
+ *
+ * Absolute line numbers and current-line offsets are normalized numerically,
+ * while "@" remains relative to the primary active-caret line at execution
+ * time.
+ *
+ * @param {string} lineReferenceText
+ * @returns {string}
+ */
+const getCanonicalLineReferenceText = (lineReferenceText) => {
+  if (lineReferenceText === "@") {
+    return "@";
+  }
+
+  if (lineReferenceText.startsWith("@")) {
+    const offset = parseInt(lineReferenceText.slice(1), 10);
+
+    return offset > 0 ? `@+${offset}` : `@${offset}`;
+  }
+
+  return String(parseInt(lineReferenceText, 10));
+};
+
+/**
+ * Build the canonical textual form of one strictly valid line specifier.
+ *
+ * Integer line and ":" coordinate components are normalized numerically.
+ * Proportional digits remain textual because they are not integer coordinates
+ * and are not resolved against document content at history-storage time.
+ *
+ * @param {string} lineReferenceText
+ * @param {string | undefined} coordinateText
+ * @param {string | undefined} proportionDigits
+ * @returns {string}
+ */
+const getCanonicalSpecifierText = (lineReferenceText, coordinateText, proportionDigits) => {
+  let canonicalText = getCanonicalLineReferenceText(lineReferenceText);
+
+  if (coordinateText !== undefined) {
+    canonicalText += `:${parseInt(coordinateText, 10)}`;
+  } else if (proportionDigits !== undefined) {
+    canonicalText += `.${proportionDigits}`;
+  }
+
+  return canonicalText;
+};
+
+/**
+ * Parse one complete accepted line range.
+ *
+ * Each specifier contains a required line reference and optionally either:
  *
  * - an integer coordinate introduced by ":";
  * - a proportion introduced by ".".
  *
+ * The returned canonical text normalizes integer syntax without resolving
+ * negative absolute lines, "@" references, clipping, or proportional positions
+ * against the current document.
+ *
  * @param {string} text
- * @returns {{
- *   startSpecifier: {
- *     lineNumber: number,
- *     secondaryInput:
- *       | null
- *       | { kind: string, value: number },
- *   },
- *   endSpecifier:
- *     | null
- *     | {
- *         lineNumber: number,
- *         secondaryInput:
- *           | null
- *           | { kind: string, value: number },
- *       },
- * } | null}
+ * @returns {ParsedLineRange | null}
  */
-const parseLineRangeInput = (text) => {
+const parseLineRange = (text) => {
   const match = text.trim().match(lineRangeRegex);
 
   if (!match) {
     return null;
   }
 
-  /**
-   * @param {string} lineText
-   * @param {string | undefined} coordinateText
-   * @param {string | undefined} proportionDigits
-   */
-  const buildSpecifier = (lineText, coordinateText, proportionDigits) => {
-    let secondaryInput = null;
-
-    if (coordinateText !== undefined) {
-      secondaryInput = {
-        kind: SecondaryInputKind.COORDINATE,
-        value: parseInt(coordinateText, 10),
-      };
-    } else if (proportionDigits !== undefined) {
-      secondaryInput = {
-        kind: SecondaryInputKind.PROPORTION,
-        value: parseProportionDigits(proportionDigits),
-      };
-    }
-
-    return {
-      lineNumber: parseInt(lineText, 10),
-      secondaryInput,
-    };
-  };
-
   const startSpecifier = buildSpecifier(match[1], match[2], match[3]);
 
   const endSpecifier = match[4] === undefined ? null : buildSpecifier(match[4], match[5], match[6]);
 
+  const canonicalStart = getCanonicalSpecifierText(match[1], match[2], match[3]);
+
+  const canonicalEnd =
+    match[4] === undefined ? null : getCanonicalSpecifierText(match[4], match[5], match[6]);
+
   return {
-    startSpecifier,
-    endSpecifier,
+    range: {
+      startSpecifier,
+      endSpecifier,
+    },
+    canonicalText: canonicalEnd === null ? canonicalStart : `${canonicalStart} ${canonicalEnd}`,
+    usesCoordinateMode: match[2] !== undefined || match[5] !== undefined,
   };
+};
+
+/**
+ * Parse the complete command input as one or more comma-separated line ranges.
+ *
+ * Empty comma-separated parts are ignored. Every non-empty part must be one
+ * complete valid line range; otherwise the entire input is rejected.
+ *
+ * The returned canonical text preserves range order and uses ", " between
+ * ranges. Integer syntax is normalized once during parsing for history
+ * deduplication and recall.
+ *
+ * @param {string} text
+ * @returns {ParsedLineRangesInput | null}
+ */
+const parseLineRangesInput = (text) => {
+  /** @type {LineRange[]} */
+  const ranges = [];
+
+  /** @type {string[]} */
+  const canonicalRangeTexts = [];
+
+  let usesCoordinateMode = false;
+
+  for (const part of text.split(",")) {
+    const rangeText = part.trim();
+
+    if (rangeText === "") {
+      continue;
+    }
+
+    const parsedRange = parseLineRange(rangeText);
+
+    if (parsedRange === null) {
+      return null;
+    }
+
+    ranges.push(parsedRange.range);
+    canonicalRangeTexts.push(parsedRange.canonicalText);
+    usesCoordinateMode ||= parsedRange.usesCoordinateMode;
+  }
+
+  return {
+    ranges,
+    canonicalText: canonicalRangeTexts.join(", "),
+    usesCoordinateMode,
+  };
+};
+
+/**
+ * Build a human-readable description of one valid line reference while
+ * performing live input validation.
+ *
+ * @param {string} lineReferenceText
+ * @returns {string}
+ */
+const getLineReferenceDescription = (lineReferenceText) => {
+  if (!lineReferenceText.startsWith("@")) {
+    return `line ${parseInt(lineReferenceText, 10)}`;
+  }
+
+  if (lineReferenceText === "@") {
+    return "the current line";
+  }
+
+  const offset = parseInt(lineReferenceText.slice(1), 10);
+
+  return offset > 0 ? `the current line + ${offset}` : `the current line - ${Math.abs(offset)}`;
 };
 
 /**
@@ -208,10 +400,10 @@ const parseLineRangeInput = (text) => {
  * performing live input validation.
  *
  * @param {string} coordinateWithColon
- * @param {{ valid: boolean, value: number }} coordinateData
+ * @param {NonZeroComponentResult} coordinateData
  * @param {string} proportionWithDot
  * @param {string} proportionDigits
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
+ * @param {CoordinateMode} coordinateMode
  * @returns {string}
  */
 const getSecondaryInputDescription = (
@@ -233,86 +425,87 @@ const getSecondaryInputDescription = (
 };
 
 /**
- * Build the live validation message for the input box.
+ * Analyze the live validation state of one line range.
  *
- * Integer secondary coordinates use ":" and follow the configured coordinate
- * mode. Proportional secondary coordinates use "." and are independent of the
- * coordinate mode.
+ * A syntactically possible but incomplete typing state is returned as
+ * incomplete with Info severity. The complete-input validator decides whether
+ * that transitional state is allowed based on the range's position.
  *
  * @param {string} text
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
- * @returns {vscode.InputBoxValidationMessage | undefined}
+ * @param {CoordinateMode} coordinateMode
+ * @returns {LineRangeValidation}
  */
-const getValidationMessage = (text, coordinateMode) => {
-  text = text.trim();
-
-  if (text === "") {
-    return undefined;
-  }
-
+const getLineRangeValidation = (text, coordinateMode) => {
   const match = text.match(permissiveLineRangeRegex);
 
   if (!match) {
     return {
+      complete: false,
       message:
         `Invalid format. Use '<line>', '<line>:<${coordinateMode}>', or ` +
-        `'<line>.<proportion-digits>' for one or two specifiers. ` +
-        `Lines and ':' ${coordinateMode} numbers must be non-zero signed integers; ` +
-        "a bare '.' means proportion 1.",
+        `'<line>.<proportion-digits>' with an absolute line or '@' line reference. ` +
+        `Absolute lines and ':' ${coordinateMode} numbers must be non-zero signed integers; ` +
+        "relative line offsets use '@+n' or '@-n' with non-zero n; a bare '.' means proportion 1.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
 
-  const startLine = match[1] || "";
+  const startLineReference = match[1] || "";
   const startCoordinateWithColon = match[2] || "";
   const startCoordinate = match[3] || "";
   const startProportionWithDot = match[4] || "";
   const startProportionDigits = match[5] ?? "";
 
-  const endLine = match[6] || "";
+  const endLineReference = match[6] || "";
   const endCoordinateWithColon = match[7] || "";
   const endCoordinate = match[8] || "";
   const endProportionWithDot = match[9] || "";
   const endProportionDigits = match[10] ?? "";
 
-  const startLineData = parseNonZeroComponent(startLine);
+  const startLineReferenceValid = strictLineReferenceRegex.test(startLineReference);
   const startCoordinateData = parseNonZeroComponent(startCoordinate);
 
-  const endLineData = parseNonZeroComponent(endLine);
+  const endLineReferenceValid = strictLineReferenceRegex.test(endLineReference);
   const endCoordinateData = parseNonZeroComponent(endCoordinate);
 
   const startSpecifierValid =
-    startLineData.valid && (startCoordinateWithColon === "" || startCoordinateData.valid);
+    startLineReferenceValid && (startCoordinateWithColon === "" || startCoordinateData.valid);
 
   const endSpecifierValid =
-    endLineData.valid && (endCoordinateWithColon === "" || endCoordinateData.valid);
+    endLineReferenceValid && (endCoordinateWithColon === "" || endCoordinateData.valid);
 
   const hasStartedEndSpecifier =
-    endLine !== "" || endCoordinateWithColon !== "" || endProportionWithDot !== "";
+    endLineReference !== "" || endCoordinateWithColon !== "" || endProportionWithDot !== "";
 
-  if ((startCoordinateWithColon !== "" || startProportionWithDot !== "") && !startLineData.valid) {
+  if (
+    (startCoordinateWithColon !== "" || startProportionWithDot !== "") &&
+    !startLineReferenceValid
+  ) {
     return {
+      complete: false,
       message:
         startCoordinateWithColon !== ""
-          ? `Finish a valid start line before adding a ${coordinateMode} number.`
-          : "Finish a valid start line before adding a proportion.",
+          ? `Finish a valid start line reference before adding a ${coordinateMode} number.`
+          : "Finish a valid start line reference before adding a proportion.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
 
   if (hasStartedEndSpecifier && !startSpecifierValid) {
     return {
+      complete: false,
       message: "Finish a valid start specifier before adding the end specifier.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
 
-  if ((endCoordinateWithColon !== "" || endProportionWithDot !== "") && !endLineData.valid) {
+  if ((endCoordinateWithColon !== "" || endProportionWithDot !== "") && !endLineReferenceValid) {
     return {
+      complete: false,
       message:
         endCoordinateWithColon !== ""
-          ? `Finish a valid end line before adding a ${coordinateMode} number.`
-          : "Finish a valid end line before adding a proportion.",
+          ? `Finish a valid end line reference before adding a ${coordinateMode} number.`
+          : "Finish a valid end line reference before adding a proportion.",
       severity: vscode.InputBoxValidationSeverity.Error,
     };
   }
@@ -321,6 +514,7 @@ const getValidationMessage = (text, coordinateMode) => {
 
   if (!isFullyValid) {
     return {
+      complete: false,
       message: "Keep typing...",
       severity: vscode.InputBoxValidationSeverity.Info,
     };
@@ -342,27 +536,175 @@ const getValidationMessage = (text, coordinateMode) => {
     coordinateMode,
   );
 
+  const startDescription =
+    getLineReferenceDescription(startLineReference) + startSecondaryDescription;
+
   let message;
 
   if (hasStartedEndSpecifier) {
-    message =
-      `Will select from line ${startLineData.value}` +
-      `${startSecondaryDescription} ` +
-      `to line ${endLineData.value}${endSecondaryDescription}`;
+    const endDescription = getLineReferenceDescription(endLineReference) + endSecondaryDescription;
+
+    message = `Will select from ${startDescription} to ${endDescription}`;
   } else {
-    message =
-      `Will select from line ${startLineData.value}` +
-      `${startSecondaryDescription} to the end of the document`;
+    message = `Will select from ${startDescription} to the end of the document`;
   }
 
   message +=
-    ` (line and ${coordinateMode} numbers are shown before ` +
+    ` (absolute line and ${coordinateMode} numbers are shown before ` +
     "negative-index normalization and clipping).";
 
   return {
+    complete: true,
     message,
     severity: vscode.InputBoxValidationSeverity.Info,
   };
+};
+
+/**
+ * Build the live validation message for the complete comma-separated input.
+ *
+ * Empty comma-separated parts are ignored. Every non-empty part is validated
+ * independently using the single-range grammar. Transitional incomplete states
+ * are allowed only for the last non-empty range; every earlier range must
+ * already be complete before another range is started.
+ *
+ * @param {string} text
+ * @param {CoordinateMode} coordinateMode
+ * @returns {vscode.InputBoxValidationMessage | undefined}
+ */
+const getValidationMessage = (text, coordinateMode) => {
+  const rangeTexts = text
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part !== "");
+
+  if (rangeTexts.length === 0) {
+    return undefined;
+  }
+
+  /** @type {LineRangeValidation[]} */
+  const validations = [];
+
+  for (let index = 0; index < rangeTexts.length; index += 1) {
+    const validation = getLineRangeValidation(rangeTexts[index], coordinateMode);
+    validations.push(validation);
+
+    if (!validation.complete) {
+      const isLastRange = index === rangeTexts.length - 1;
+
+      if (!isLastRange) {
+        return {
+          message:
+            `Range ${index + 1}: Complete this range before starting the next range. ` +
+            validation.message,
+          severity: vscode.InputBoxValidationSeverity.Error,
+        };
+      }
+
+      return {
+        message:
+          rangeTexts.length === 1
+            ? validation.message
+            : `Range ${index + 1}: ${validation.message}`,
+        severity: validation.severity,
+      };
+    }
+  }
+
+  if (validations.length === 1) {
+    return {
+      message: validations[0].message,
+      severity: validations[0].severity,
+    };
+  }
+
+  return {
+    message: `Will create ${validations.length} selections.`,
+    severity: vscode.InputBoxValidationSeverity.Info,
+  };
+};
+
+/**
+ * Return the persistent history-storage key for one document.
+ *
+ * @param {vscode.TextDocument} document
+ * @returns {string}
+ */
+const getHistoryStorageKey = (document) => `${HISTORY_STORAGE_PREFIX}${document.uri.toString()}`;
+
+/**
+ * Read the stored command history for one document.
+ *
+ * @param {vscode.ExtensionContext} context
+ * @param {vscode.TextDocument} document
+ * @returns {HistoryEntry[]}
+ */
+const getHistoryEntries = (context, document) => {
+  const history = /** @type {HistoryEntry[]} */ (
+    context.globalState.get(getHistoryStorageKey(document), [])
+  );
+
+  return history;
+};
+
+/**
+ * Return history entries compatible with the current integer coordinate mode.
+ *
+ * Entries that contain no ":" coordinates are mode-independent and therefore
+ * remain available in both character and column modes.
+ *
+ * @param {HistoryEntry[]} history
+ * @param {CoordinateMode} coordinateMode
+ * @returns {HistoryEntry[]}
+ */
+const getCompatibleHistoryEntries = (history, coordinateMode) =>
+  history.filter((entry) => !entry.usesCoordinateMode || entry.coordinateMode === coordinateMode);
+
+/**
+ * Determine whether two history entries represent the same command input.
+ *
+ * Coordinate mode contributes to identity only when the input actually uses
+ * ":" coordinates.
+ *
+ * @param {HistoryEntry} left
+ * @param {HistoryEntry} right
+ * @returns {boolean}
+ */
+const areHistoryEntriesEquivalent = (left, right) =>
+  left.text === right.text &&
+  left.usesCoordinateMode === right.usesCoordinateMode &&
+  (!left.usesCoordinateMode || left.coordinateMode === right.coordinateMode);
+
+/**
+ * Store one successfully executed GUI input in per-document history.
+ *
+ * Every entry records the coordinate mode active when it was executed.
+ * Deduplication treats coordinate mode as part of the entry identity only when
+ * the input contains at least one ":" coordinate. Range order is preserved
+ * because it determines the primary selection.
+ *
+ * @param {vscode.ExtensionContext} context
+ * @param {vscode.TextDocument} document
+ * @param {ParsedLineRangesInput} parsedInput
+ * @param {CoordinateMode} coordinateMode
+ * @returns {Thenable<void>}
+ */
+const addHistoryEntry = (context, document, parsedInput, coordinateMode) => {
+  /** @type {HistoryEntry} */
+  const newEntry = {
+    text: parsedInput.canonicalText,
+    coordinateMode: coordinateMode,
+    usesCoordinateMode: parsedInput.usesCoordinateMode,
+  };
+
+  const history = getHistoryEntries(context, document);
+
+  const updatedHistory = [
+    newEntry,
+    ...history.filter((entry) => !areHistoryEntriesEquivalent(entry, newEntry)),
+  ].slice(0, HISTORY_LIMIT);
+
+  return context.globalState.update(getHistoryStorageKey(document), updatedHistory);
 };
 
 /**
@@ -370,13 +712,18 @@ const getValidationMessage = (text, coordinateMode) => {
  *
  * Unlike vscode.window.showInputBox(), this explicitly controls acceptance.
  * Informational validation states therefore remain non-blocking visually while
- * Enter is accepted only when the complete value matches the strict grammar.
+ * Enter is accepted only when every non-empty comma-separated range satisfies
+ * the strict grammar.
  *
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
- * @param {(typeof ProportionSnap)[keyof typeof ProportionSnap]} proportionSnap
- * @returns {Promise<string | undefined>}
+ * Previous/next buttons navigate compatible per-document history. One history
+ * record represents the complete comma-separated command input.
+ *
+ * @param {CoordinateMode} coordinateMode
+ * @param {ProportionSnap} proportionSnap
+ * @param {HistoryEntry[]} historyEntries Newest entry first.
+ * @returns {Promise<ParsedLineRangesInput | undefined>}
  */
-const showLineRangeInputBox = (coordinateMode, proportionSnap) =>
+const showLineRangeInputBox = (coordinateMode, proportionSnap, historyEntries) =>
   new Promise((resolve) => {
     const inputBox = vscode.window.createInputBox();
 
@@ -399,26 +746,61 @@ const showLineRangeInputBox = (coordinateMode, proportionSnap) =>
     inputBox.title = "Select Line Range";
 
     inputBox.prompt =
-      `Enter one or two specifiers using '<line>', ` +
-      `'<line>:<${coordinateMode}>', or '<line>.<proportion-digits>'. ` +
-      "Line numbers are 1-based. " +
+      "Enter one or more ranges separated by commas. " +
+      `Each range uses one or two specifiers: '<line>', '<line>:<${coordinateMode}>', ` +
+      "or '<line>.<proportion-digits>'. " +
+      "Use '@' as the current primary-caret line, optionally followed by a non-zero " +
+      "relative offset such as '@+5' or '@-3'. " +
+      "Absolute line numbers are 1-based. " +
       coordinateSemantics +
       "For proportional syntax, '.25' means proportion 0.25, '.0' means " +
-      "the beginning of the line, and a bare '.' means proportion 1. " +
+      "the beginning of the resolved line, and a bare '.' means proportion 1. " +
       proportionSnapSemantics +
-      `Negative line and ${coordinateMode} numbers count from the end. ` +
+      `Negative absolute line and ${coordinateMode} numbers count from the end. ` +
       "An omitted end specifier means the end of the document, and " +
       `out-of-bounds line and ${coordinateMode} numbers are clipped.`;
 
-    inputBox.placeholder = "e.g. 13, 13:2 20, 13.25 20.75, 13. -1:6";
+    inputBox.placeholder = "e.g. 13:2 20, @-2.25 @+2.75, @:5, 30. 25:3";
 
-    /** @type {string | undefined} */
+    const previousHistoryButton = {
+      iconPath: new vscode.ThemeIcon("chevron-up"),
+      tooltip: "Previous history entry",
+    };
+
+    const nextHistoryButton = {
+      iconPath: new vscode.ThemeIcon("chevron-down"),
+      tooltip: "Next history entry",
+    };
+
+    if (historyEntries.length > 0) {
+      inputBox.buttons = [previousHistoryButton, nextHistoryButton];
+    }
+
+    /** @type {ParsedLineRangesInput | undefined} */
     let acceptedValue;
 
     let settled = false;
 
+    /*
+     * -1 represents the current editable draft. Non-negative values index the
+     * newest-first historyEntries array.
+     */
+    let historyIndex = -1;
+    let draftValue = "";
+
     /** @type {vscode.Disposable[]} */
     const disposables = [];
+
+    /**
+     * Set the input-box value and place the caret at its end.
+     *
+     * @param {string} value
+     * @returns {void}
+     */
+    const setInputValue = (value) => {
+      inputBox.value = value;
+      inputBox.valueSelection = [value.length, value.length];
+    };
 
     const finish = () => {
       if (settled) {
@@ -437,24 +819,54 @@ const showLineRangeInputBox = (coordinateMode, proportionSnap) =>
 
     disposables.push(
       inputBox.onDidChangeValue((value) => {
+        if (historyIndex === -1) {
+          draftValue = value;
+        }
+
         inputBox.validationMessage = getValidationMessage(value, coordinateMode);
       }),
     );
 
     disposables.push(
-      inputBox.onDidAccept(() => {
-        const value = inputBox.value.trim();
+      inputBox.onDidTriggerButton((button) => {
+        if (button === previousHistoryButton) {
+          if (historyEntries.length === 0 || historyIndex >= historyEntries.length - 1) {
+            return;
+          }
 
-        if (value === "") {
+          if (historyIndex === -1) {
+            draftValue = inputBox.value;
+          }
+
+          historyIndex += 1;
+          setInputValue(historyEntries[historyIndex].text);
+          return;
+        }
+
+        if (button !== nextHistoryButton || historyIndex === -1) {
+          return;
+        }
+
+        historyIndex -= 1;
+
+        setInputValue(historyIndex === -1 ? draftValue : historyEntries[historyIndex].text);
+      }),
+    );
+
+    disposables.push(
+      inputBox.onDidAccept(() => {
+        const parsedInput = parseLineRangesInput(inputBox.value);
+
+        if (parsedInput === null) {
+          return;
+        }
+
+        if (parsedInput.ranges.length === 0) {
           inputBox.hide();
           return;
         }
 
-        if (parseLineRangeInput(value) === null) {
-          return;
-        }
-
-        acceptedValue = value;
+        acceptedValue = parsedInput;
         inputBox.hide();
       }),
     );
@@ -465,22 +877,56 @@ const showLineRangeInputBox = (coordinateMode, proportionSnap) =>
   });
 
 /**
- * Normalize a signed 1-based line number and clip it to the document.
+ * Clip a 1-based line number to the document without applying negative-index
+ * semantics.
+ *
+ * @param {number} lineNumber
+ * @param {number} lineCount
+ * @returns {number}
+ */
+const clipLineNumber = (lineNumber, lineCount) => {
+  if (lineNumber < 1) {
+    return 1;
+  }
+
+  if (lineNumber > lineCount) {
+    return lineCount;
+  }
+
+  return lineNumber;
+};
+
+/**
+ * Normalize a signed absolute 1-based line number and clip it to the document.
  *
  * @param {number} lineNumber
  * @param {number} lineCount
  * @returns {number} A valid 1-based line number.
  */
 const normalizeAndClipLineNumber = (lineNumber, lineCount) => {
-  let resolvedLineNumber = lineNumber < 0 ? lineCount + 1 + lineNumber : lineNumber;
+  const resolvedLineNumber = lineNumber < 0 ? lineCount + 1 + lineNumber : lineNumber;
 
-  if (resolvedLineNumber < 1) {
-    resolvedLineNumber = 1;
-  } else if (resolvedLineNumber > lineCount) {
-    resolvedLineNumber = lineCount;
+  return clipLineNumber(resolvedLineNumber, lineCount);
+};
+
+/**
+ * Resolve one parsed line reference to a valid 1-based document line number.
+ *
+ * Absolute negative numbers use end-relative document indexing. Current-line
+ * references use the captured primary active-caret line plus their relative
+ * offset, then clip directly to the document bounds.
+ *
+ * @param {LineReference} lineReference
+ * @param {number} currentLineNumber
+ * @param {number} lineCount
+ * @returns {number}
+ */
+const resolveLineReference = (lineReference, currentLineNumber, lineCount) => {
+  if (lineReference.kind === LineReferenceKind.CURRENT) {
+    return clipLineNumber(currentLineNumber + lineReference.offset, lineCount);
   }
 
-  return resolvedLineNumber;
+  return normalizeAndClipLineNumber(lineReference.lineNumber, lineCount);
 };
 
 /**
@@ -545,12 +991,7 @@ const graphemeSegmenter = new Intl.Segmenter(undefined, {
  * @param {vscode.TextDocument} document
  * @param {number} lineNumber 1-based line number.
  * @param {number} tabSize
- * @returns {{
- *   lineNumber: number,
- *   graphemeCount: number,
- *   boundaryVscodePositions: number[],
- *   boundaryLogicalWidths: number[],
- * }}
+ * @returns {LineAnalysis}
  */
 const analyzeLine = (document, lineNumber, tabSize) => {
   const text = document.lineAt(lineNumber - 1).text;
@@ -580,6 +1021,29 @@ const analyzeLine = (document, lineNumber, tabSize) => {
     boundaryVscodePositions,
     boundaryLogicalWidths,
   };
+};
+
+/**
+ * Return a cached analysis for one resolved 1-based line number.
+ *
+ * The cache is local to one command invocation, so analyses are never reused
+ * across document edits or editor-option changes between invocations.
+ *
+ * @param {vscode.TextDocument} document
+ * @param {number} lineNumber
+ * @param {number} tabSize
+ * @param {LineAnalysisCache} lineAnalysisByLineNumber
+ * @returns {LineAnalysis}
+ */
+const getLineAnalysis = (document, lineNumber, tabSize, lineAnalysisByLineNumber) => {
+  let lineAnalysis = lineAnalysisByLineNumber.get(lineNumber);
+
+  if (lineAnalysis === undefined) {
+    lineAnalysis = analyzeLine(document, lineNumber, tabSize);
+    lineAnalysisByLineNumber.set(lineNumber, lineAnalysis);
+  }
+
+  return lineAnalysis;
 };
 
 /**
@@ -616,13 +1080,9 @@ const normalizeAndClipCoordinate = (coordinateNumber, maximumCoordinate) => {
  *   Column n resolves directly to boundary index n - 1.
  *
  * @param {number} coordinateNumber
- * @param {{ graphemeCount: number }} lineAnalysis
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
- * @returns {{
- *   kind: string,
- *   characterNumber?: number,
- *   boundaryIndex?: number,
- * } | null}
+ * @param {LineAnalysis} lineAnalysis
+ * @param {CoordinateMode} coordinateMode
+ * @returns {SelectionTarget | null}
  */
 const resolveCoordinateTarget = (coordinateNumber, lineAnalysis, coordinateMode) => {
   const maximumCoordinate =
@@ -659,12 +1119,9 @@ const resolveCoordinateTarget = (coordinateNumber, lineAnalysis, coordinateMode)
  * Floating-point tolerance is checked before applying the configured snapping
  * behavior so a mathematically exact boundary is not accidentally skipped.
  *
- * @param {{
- *   graphemeCount: number,
- *   boundaryLogicalWidths: number[],
- * }} lineAnalysis
+ * @param {LineAnalysis} lineAnalysis
  * @param {number} proportion
- * @param {(typeof ProportionSnap)[keyof typeof ProportionSnap]} proportionSnap
+ * @param {ProportionSnap} proportionSnap
  * @returns {number} A valid grapheme boundary index.
  */
 const resolveProportionBoundaryIndex = (lineAnalysis, proportion, proportionSnap) => {
@@ -738,21 +1195,11 @@ const resolveProportionBoundaryIndex = (lineAnalysis, proportion, proportionSnap
  * Integer ":" coordinates are interpreted according to coordinateMode.
  * Proportional "." coordinates always resolve directly to a boundary target.
  *
- * @param {{
- *   kind: string,
- *   value: number,
- * }} secondaryInput
- * @param {{
- *   graphemeCount: number,
- *   boundaryLogicalWidths: number[],
- * }} lineAnalysis
- * @param {(typeof CoordinateMode)[keyof typeof CoordinateMode]} coordinateMode
- * @param {(typeof ProportionSnap)[keyof typeof ProportionSnap]} proportionSnap
- * @returns {{
- *   kind: string,
- *   characterNumber?: number,
- *   boundaryIndex?: number,
- * } | null}
+ * @param {SecondaryInput} secondaryInput
+ * @param {LineAnalysis} lineAnalysis
+ * @param {CoordinateMode} coordinateMode
+ * @param {ProportionSnap} proportionSnap
+ * @returns {SelectionTarget | null}
  */
 const resolveExplicitTarget = (secondaryInput, lineAnalysis, coordinateMode, proportionSnap) => {
   if (secondaryInput.kind === SecondaryInputKind.PROPORTION) {
@@ -785,11 +1232,7 @@ const resolveExplicitTarget = (secondaryInput, lineAnalysis, coordinateMode, pro
  * same direction comparison before character targets are converted to their
  * final inclusive boundaries.
  *
- * @param {{
- *   kind: string,
- *   characterNumber?: number,
- *   boundaryIndex?: number,
- * }} target
+ * @param {SelectionTarget} target
  * @returns {number}
  */
 const getTargetOrder = (target) => {
@@ -817,16 +1260,8 @@ const getTargetOrder = (target) => {
  *
  * @param {number} startLineNumber
  * @param {number} endLineNumber
- * @param {{
- *   kind: string,
- *   characterNumber?: number,
- *   boundaryIndex?: number,
- * } | null} startTarget
- * @param {{
- *   kind: string,
- *   characterNumber?: number,
- *   boundaryIndex?: number,
- * } | null} endTarget
+ * @param {SelectionTarget | null} startTarget
+ * @param {SelectionTarget | null} endTarget
  * @returns {boolean}
  */
 const isForwardSelection = (startLineNumber, endLineNumber, startTarget, endTarget) => {
@@ -871,14 +1306,8 @@ const isForwardSelection = (startLineNumber, endLineNumber, startTarget, endTarg
  *   start -> line-end boundary graphemeCount
  *   end   -> line-start boundary 0
  *
- * @param {{
- *   graphemeCount: number,
- * }} lineAnalysis
- * @param {{
- *   kind: string,
- *   characterNumber?: number,
- *   boundaryIndex?: number,
- * } | null} target
+ * @param {LineAnalysis} lineAnalysis
+ * @param {SelectionTarget | null} target
  * @param {boolean} isStart
  * @param {boolean} forwardSelection
  * @returns {number}
@@ -911,14 +1340,147 @@ const resolveTargetBoundaryIndex = (lineAnalysis, target, isStart, forwardSelect
  *
  *   0 .. graphemeCount
  *
- * @param {{
- *   boundaryVscodePositions: number[],
- * }} lineAnalysis
+ * @param {LineAnalysis} lineAnalysis
  * @param {number} boundaryIndex
  * @returns {number}
  */
 const getVscodePositionIndex = (lineAnalysis, boundaryIndex) =>
   lineAnalysis.boundaryVscodePositions[boundaryIndex];
+
+/**
+ * Resolve one already-parsed line range without mutating the editor.
+ *
+ * The caller supplies the current primary-caret line captured before any new
+ * selections are applied. Both returned positions are preserved even when they
+ * are equal; the caller decides how zero-length selections should be handled.
+ *
+ * @param {LineRange} parsedRange
+ * @param {vscode.TextDocument} document
+ * @param {number} currentLineNumber
+ * @param {CoordinateMode} coordinateMode
+ * @param {ProportionSnap} proportionSnap
+ * @param {number} tabSize
+ * @param {LineAnalysisCache} lineAnalysisByLineNumber
+ * @returns {ResolvedLineRange}
+ */
+const resolveLineRange = (
+  parsedRange,
+  document,
+  currentLineNumber,
+  coordinateMode,
+  proportionSnap,
+  tabSize,
+  lineAnalysisByLineNumber,
+) => {
+  const lineCount = document.lineCount;
+
+  // -----------------------------------------------------------------------
+  // Stage 1: Resolve start/end line references.
+  // -----------------------------------------------------------------------
+
+  const startLineNumber = resolveLineReference(
+    parsedRange.startSpecifier.lineReference,
+    currentLineNumber,
+    lineCount,
+  );
+
+  const endLineNumber =
+    parsedRange.endSpecifier === null
+      ? lineCount
+      : resolveLineReference(parsedRange.endSpecifier.lineReference, currentLineNumber, lineCount);
+
+  // -----------------------------------------------------------------------
+  // Stage 2: Obtain cached analyses for the resolved endpoint lines.
+  // -----------------------------------------------------------------------
+
+  const startLineAnalysis = getLineAnalysis(
+    document,
+    startLineNumber,
+    tabSize,
+    lineAnalysisByLineNumber,
+  );
+
+  const endLineAnalysis = getLineAnalysis(
+    document,
+    endLineNumber,
+    tabSize,
+    lineAnalysisByLineNumber,
+  );
+
+  // -----------------------------------------------------------------------
+  // Stage 3: Resolve explicitly supplied secondary inputs to semantic
+  // targets. Omitted or unusable targets remain null until direction is known.
+  // -----------------------------------------------------------------------
+
+  const startTarget =
+    parsedRange.startSpecifier.secondaryInput === null
+      ? null
+      : resolveExplicitTarget(
+          parsedRange.startSpecifier.secondaryInput,
+          startLineAnalysis,
+          coordinateMode,
+          proportionSnap,
+        );
+
+  const endTarget =
+    parsedRange.endSpecifier === null || parsedRange.endSpecifier.secondaryInput === null
+      ? null
+      : resolveExplicitTarget(
+          parsedRange.endSpecifier.secondaryInput,
+          endLineAnalysis,
+          coordinateMode,
+          proportionSnap,
+        );
+
+  // -----------------------------------------------------------------------
+  // Stage 4: Determine direction while character targets and boundary targets
+  // still retain their distinct semantics.
+  // -----------------------------------------------------------------------
+
+  const forwardSelection = isForwardSelection(
+    startLineNumber,
+    endLineNumber,
+    startTarget,
+    endTarget,
+  );
+
+  // -----------------------------------------------------------------------
+  // Stage 5: Resolve both endpoints to concrete grapheme boundary indices.
+  // -----------------------------------------------------------------------
+
+  const startBoundaryIndex = resolveTargetBoundaryIndex(
+    startLineAnalysis,
+    startTarget,
+    true,
+    forwardSelection,
+  );
+
+  const endBoundaryIndex = resolveTargetBoundaryIndex(
+    endLineAnalysis,
+    endTarget,
+    false,
+    forwardSelection,
+  );
+
+  // -----------------------------------------------------------------------
+  // Stage 6: Translate grapheme boundary indices to VS Code positions.
+  // -----------------------------------------------------------------------
+
+  const anchor = new vscode.Position(
+    startLineNumber - 1,
+    getVscodePositionIndex(startLineAnalysis, startBoundaryIndex),
+  );
+
+  const active = new vscode.Position(
+    endLineNumber - 1,
+    getVscodePositionIndex(endLineAnalysis, endBoundaryIndex),
+  );
+
+  return {
+    anchor,
+    active,
+  };
+};
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -936,14 +1498,20 @@ function activate(context) {
         return;
       }
 
+      /*
+       * Capture the primary active-caret line before any asynchronous UI work
+       * or selection changes. Every "@" in this invocation resolves from this
+       * same 1-based line.
+       */
+      const currentLineNumber = editor.selection.active.line + 1;
+
       const configuration = vscode.workspace.getConfiguration(
         "advanced-line-range-selection",
         editor.document.uri,
       );
 
-      const configuredCoordinateMode = configuration.get(
-        "coordinateMode",
-        CoordinateMode.CHARACTER,
+      const configuredCoordinateMode = /** @type {CoordinateMode} */ (
+        configuration.get("coordinateMode", CoordinateMode.CHARACTER)
       );
 
       const coordinateMode =
@@ -951,7 +1519,9 @@ function activate(context) {
           ? CoordinateMode.COLUMN
           : CoordinateMode.CHARACTER;
 
-      const configuredProportionSnap = configuration.get("proportionSnap", ProportionSnap.NEAREST);
+      const configuredProportionSnap = /** @type {ProportionSnap} */ (
+        configuration.get("proportionSnap", ProportionSnap.NEAREST)
+      );
 
       const proportionSnap =
         configuredProportionSnap === ProportionSnap.BEFORE
@@ -960,144 +1530,94 @@ function activate(context) {
             ? ProportionSnap.AFTER
             : ProportionSnap.NEAREST;
 
-      let input;
+      /** @type {ParsedLineRangesInput | undefined} */
+      let parsedInput;
+
+      let shouldAddToHistory = false;
 
       if (rangeInput === undefined) {
-        input = await showLineRangeInputBox(coordinateMode, proportionSnap);
+        const compatibleHistory = getCompatibleHistoryEntries(
+          getHistoryEntries(context, editor.document),
+          coordinateMode,
+        );
 
-        if (input === undefined) {
+        parsedInput = await showLineRangeInputBox(
+          coordinateMode,
+          proportionSnap,
+          compatibleHistory,
+        );
+
+        if (parsedInput === undefined) {
           return;
         }
+
+        shouldAddToHistory = true;
       } else {
         if (typeof rangeInput !== "string") {
           return;
         }
 
-        input = rangeInput;
+        const directlyParsedInput = parseLineRangesInput(rangeInput);
+
+        if (directlyParsedInput === null) {
+          return;
+        }
+
+        parsedInput = directlyParsedInput;
       }
 
-      const parsedInput = parseLineRangeInput(input);
-
-      /*
-       * Defensive check
-       */
-      if (parsedInput === null) {
+      if (parsedInput.ranges.length === 0) {
         return;
       }
 
       const document = editor.document;
-      const lineCount = document.lineCount;
       const tabSize = getEffectiveTabSize(editor);
 
-      // -------------------------------------------------------------------
-      // Stage 1: Resolve start/end line numbers.
-      // -------------------------------------------------------------------
+      /** @type {LineAnalysisCache} */
+      const lineAnalysisByLineNumber = new Map();
 
-      const startLineNumber = normalizeAndClipLineNumber(
-        parsedInput.startSpecifier.lineNumber,
-        lineCount,
-      );
+      /** @type {vscode.Selection[]} */
+      const selections = [];
 
-      const endLineNumber =
-        parsedInput.endSpecifier === null
-          ? lineCount
-          : normalizeAndClipLineNumber(parsedInput.endSpecifier.lineNumber, lineCount);
+      for (const parsedRange of parsedInput.ranges) {
+        const resolvedRange = resolveLineRange(
+          parsedRange,
+          document,
+          currentLineNumber,
+          coordinateMode,
+          proportionSnap,
+          tabSize,
+          lineAnalysisByLineNumber,
+        );
 
-      // -------------------------------------------------------------------
-      // Stage 2: Analyze the resolved endpoint lines.
-      // -------------------------------------------------------------------
+        /*
+         * Preserve the command's existing behavior for zero-length results.
+         * The resolver deliberately returns them; this caller chooses to skip
+         * them rather than create or move a caret.
+         */
+        if (resolvedRange.anchor.isEqual(resolvedRange.active)) {
+          continue;
+        }
 
-      const startLineAnalysis = analyzeLine(document, startLineNumber, tabSize);
+        selections.push(new vscode.Selection(resolvedRange.anchor, resolvedRange.active));
+      }
 
-      const endLineAnalysis =
-        endLineNumber === startLineNumber
-          ? startLineAnalysis
-          : analyzeLine(document, endLineNumber, tabSize);
-
-      // -------------------------------------------------------------------
-      // Stage 3: Resolve explicitly supplied secondary inputs to semantic
-      // targets. Omitted or unusable targets remain null until direction is
-      // known.
-      // -------------------------------------------------------------------
-
-      const startTarget =
-        parsedInput.startSpecifier.secondaryInput === null
-          ? null
-          : resolveExplicitTarget(
-              parsedInput.startSpecifier.secondaryInput,
-              startLineAnalysis,
-              coordinateMode,
-              proportionSnap,
-            );
-
-      const endTarget =
-        parsedInput.endSpecifier === null || parsedInput.endSpecifier.secondaryInput === null
-          ? null
-          : resolveExplicitTarget(
-              parsedInput.endSpecifier.secondaryInput,
-              endLineAnalysis,
-              coordinateMode,
-              proportionSnap,
-            );
-
-      // -------------------------------------------------------------------
-      // Stage 4: Determine direction while character targets and boundary
-      // targets still retain their distinct semantics.
-      // -------------------------------------------------------------------
-
-      const forwardSelection = isForwardSelection(
-        startLineNumber,
-        endLineNumber,
-        startTarget,
-        endTarget,
-      );
-
-      // -------------------------------------------------------------------
-      // Stage 5: Resolve both endpoints to concrete grapheme boundary
-      // indices.
-      // -------------------------------------------------------------------
-
-      const startBoundaryIndex = resolveTargetBoundaryIndex(
-        startLineAnalysis,
-        startTarget,
-        true,
-        forwardSelection,
-      );
-
-      const endBoundaryIndex = resolveTargetBoundaryIndex(
-        endLineAnalysis,
-        endTarget,
-        false,
-        forwardSelection,
-      );
-
-      // -------------------------------------------------------------------
-      // Stage 6: Translate grapheme boundary indices to the UTF-16 numeric
-      // positions required by vscode.Position.
-      // -------------------------------------------------------------------
-
-      const startCharacterPosition = getVscodePositionIndex(startLineAnalysis, startBoundaryIndex);
-
-      const endCharacterPosition = getVscodePositionIndex(endLineAnalysis, endBoundaryIndex);
-
-      const startPos = new vscode.Position(startLineNumber - 1, startCharacterPosition);
-
-      const endPos = new vscode.Position(endLineNumber - 1, endCharacterPosition);
-
-      /*
-       * If both endpoints resolve to the same physical VS Code position,
-       * there is no text to select.
-       */
-      if (startPos.isEqual(endPos)) {
+      if (selections.length === 0) {
         return;
       }
 
-      const selection = new vscode.Selection(startPos, endPos);
+      /*
+       * Let VS Code apply its normal multiple-selection behavior, including the
+       * user's editor.multiCursorMergeOverlapping preference.
+       */
+      editor.selections = selections;
 
-      editor.selection = selection;
+      if (shouldAddToHistory) {
+        await addHistoryEntry(context, document, parsedInput, coordinateMode);
+      }
 
-      // Keep the active end of the selection visible.
-      editor.revealRange(selection, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+      // Keep the active end of the primary resulting selection visible.
+      editor.revealRange(editor.selection, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
     },
   );
 
